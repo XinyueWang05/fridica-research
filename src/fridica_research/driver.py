@@ -328,7 +328,10 @@ class Driver:
             log.warning("daemon unavailable: %s", e)
             return 0, True
         n = 0
-        for e in page.get("events", []):
+        events = page.get("events", [])
+        results = {e.get("job_id") for e in events if e.get("kind") == "job_result"}
+        for e in events:
+            if e.get("kind") == "job" and e.get("action") == "failed" and e.get("job_id") in results: continue  # #45: the job_result beside it is the completion
             cursor = int(e.get("cursor", page["next"]))
             if self.observe_round(e):
                 n += 1

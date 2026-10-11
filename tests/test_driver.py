@@ -65,6 +65,21 @@ def test_root_post_starts_a_study_and_runs_to_claim(world):
     assert drv.store.cursor == len(server.events)
 
 
+def test_partial_result_failed_then_finished_in_one_page_is_one_completion(world):
+    """#45: fridica emits a partial result as `job` failed, then `job_result` finished; the driver must not retry the stage."""
+    server, cfg = world
+    thread = "T1:C1:1700000000.000150"
+    server.root(thread, OWNER, root_text())
+    drv = make_driver(cfg)
+    drain(drv)
+    server.finish_job(thread, server.job_of(thread, "explorer")["id"], result(status="partial", report=EXPLORER_REPORT))
+    assert [(e["kind"], e.get("action") or e.get("job_status")) for e in server.events[-2:]] == [("job", "failed"), ("job_result", "finished")]
+    drain(drv)
+    s = drv.store.load(thread)
+    assert s.stage == "Claim" and s.attempt == 1
+    assert len([j for j in server.view(thread)["jobs"] if j["role"] == "explorer"]) == 1
+
+
 def test_peer_root_without_generation_line_is_never_followed(world):
     server, cfg = world
     thread = "T1:C1:1700000000.000200"

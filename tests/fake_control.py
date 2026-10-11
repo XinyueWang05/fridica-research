@@ -78,12 +78,17 @@ class FakeControl:
         return self.message(thread, sender, text, kind, ts=thread.rsplit(":", 1)[1])
 
     def finish_job(self, thread: str, job_id: str, result: dict | None, status: str = "finished", code: str | None = None):
+        """A result whose status is not done comes as fridica sends it (src/control/events.rs): a failed `job`, then a finished `job_result` (#45)."""
+        job = {}
         for j in self.view(thread)["jobs"]:
             if j["id"] == job_id:
                 j["job_status"], j["result"], j["error"] = status, result, code
-        e = {"kind": "job", **self.place(thread), "action": status, "job_id": job_id, "attempt": 1}
+                job = j
+        action = "failed" if status == "finished" and (result or {}).get("status", "") not in ("", "done", "complete") else status
+        e = {"kind": "job", **self.place(thread), "action": action, "job_id": job_id, "attempt": 1}
         e["status" if status == "finished" else "code"] = (result or {}).get("status") if status == "finished" else code
         self.push(e)
+        if action != status: self.push({"kind": "job_result", **self.place(thread), "join_group": job.get("inbox_id", ""), "job_id": job_id, "worker_id": job.get("worker_id", ""), "role": job.get("role", ""), "attempt": 1, "job_status": status, "result": result, "code": code})
 
     def job_of(self, thread: str, role: str, nth: int = -1) -> dict:
         return [j for j in self.view(thread)["jobs"] if j["role"] == role or (j["role"] == "debater" and any(tag.endswith(f"-{role}") for tag in j.get("tags", [])))][nth]
