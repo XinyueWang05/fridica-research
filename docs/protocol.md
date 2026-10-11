@@ -595,14 +595,18 @@ enforces the rule, or the issue that will; "by hand" means the floor manager doe
 
 - **R15. DriverBackend protocol.** Status: retired (#19, #22). A `backend/protocol.py` with a
   bootstrap backend (subprocess `claude -p` / `codex exec` workers, journal-file posts) and a
-  fridica backend; the bootstrap runner duplicated fridica's worker supervision (#29).
+  fridica backend. Retired because #19 was dropped by the floor manager (Cheng, 2026-10-11) as
+  outside the floor-manager scope (R48): an AI backend, worker runner and feed journal matter
+  only for AI-delegated studies, which R47 makes opt-in; PR #23 closed with it.
 - **R16. Protocol as data.** Status: retired (#19, #22). Stages, workers, convergence and
   transitions declared in `protocols/*.yaml` and interpreted by the engine.
 - **R17. Study provenance and bootstrap policy.** Status: retired (#19, #22). The surviving
   fields (`generation`, `producer`, `subject`, `target`, `BootstrapPolicy`) are specified under
   Repository provenance above (`provenance.py`).
 - **R18. Candidate isolation.** Status: retired (#19, #22). Self-host implementers in
-  `worktrees/candidate-R<n+1>`, promotion by restart; self-host execution is deferred to #29.
+  `worktrees/candidate-R<n+1>`, promotion by restart. Self-host execution was dropped, not
+  deferred: #22 (and with it #29) was dropped by the floor manager (2026-10-11) as outside the
+  floor-manager scope.
 - **R19. Canonical replay corpus.** Status: in force. Enforced by: `replay.py`,
   `tests/bootstrap/`, `fridica-research replay --strict` as the merge gate (section R19 above).
 - **R20. Three levels of self-modification and the N-1 auditor.** Status: retired (#19, #22).
@@ -648,7 +652,9 @@ enforces the rule, or the issue that will; "by hand" means the floor manager doe
   current generation cannot, and each PR's acceptance names the duty it takes over. Every stage
   post says which side did the work. Enforced by: the handover ledger (section R25 above), by hand.
 - **R26. Delegation, budgets and standing rules.** Status: in force. (1) The implementer of a PR
-  is never one of its reviewers; jobs go to the crew, assigned by the floor manager (R49); the
+  is never one of its reviewers. The original bullet (cards offered in the thread, `taking #N`,
+  the driver's own worker taking a card after `offer_window`) was replaced: jobs go to the crew,
+  assigned by the floor manager (R49); the
   driver's own AI worker takes a role a person holds only on an explicit per-role opt-in (R47.1).
   (2) The driver tracks its budgets (per-study cost, the owner's session and credit limits);
   below the low watermark it starts no new local workers and hands in-flight cards to the crew
@@ -688,7 +694,8 @@ enforces the rule, or the issue that will; "by hand" means the floor manager doe
   repos provide. Enforced by: `roles/auditor.md`, `briefs.py`.
   - *Decision (2026-10-05):* auditor v2 core rules 4, 9, 11, 16, 17, 18, 21, 22, 23 restored;
     Tianhao's wording kept for 1, 24, 25, 28; severity bar and three-round limit kept; PR #23's
-    runner direction deferred to the owner (closed as #29).
+    runner direction was deferred to the owner then, and later dropped: #29 was dropped
+    (2026-10-11) as moot once #19 and PR #23 were dropped. Nothing is pending on it.
 
 ### PR cadence and per-PR threads (R35–R40)
 
@@ -696,7 +703,9 @@ enforces the rule, or the issue that will; "by hand" means the floor manager doe
   once; the others stay draft in an ordered queue (order set by the owner) and the next is
   promoted only after the active one merges. Enforced by: not in code; #46 slice 4 (merge and
   next queued root).
-- **R36. Two reviewers, either passes.** Status: superseded by R38.
+- **R36. Two reviewers, either passes.** Status: superseded by R38. Each PR had exactly two
+  reviewers (never its implementer), and one non-bot approval on the current head from either
+  merged it.
 - **R37. One-day cadence and bundling.** Status: superseded by R49. A PR was projected at a flat
   24 h with small changes bundled per day; job sizes and ETAs are now the floor manager's (R49).
 - **R38. One thread and four roles per PR.** Status: in force (effective from PR #27). Each PR
@@ -785,7 +794,8 @@ enforces the rule, or the issue that will; "by hand" means the floor manager doe
   liveness, response), never a guessed cause; each step fires once per job with a `ref:` line;
   window W = clamp(25% of estimated hours, 15 min, 60 min): checkpoint at acceptance, check-in at
   the ETA, re-estimate or arbitrate on a reply, reschedule on silence or a second miss, the owner
-  when rescheduling is impossible. Causes are recorded only as reported; every miss is a ledger
+  when rescheduling is impossible or the question is about scope or merges.
+  Causes are recorded only as reported; every miss is a ledger
   row and counts against the floor manager (R48). Enforced by: #46 slice 3, #53.
   - *Amendment (2026-10-11 15:00 ET):* Outies are not a fallback for a missed deadline. An Outie
     is brought in only for a permission, hardware or internet blocker its Innie reports; silence
