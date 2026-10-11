@@ -25,7 +25,7 @@ on the board (R51). The register of Innies, their Outies, capacity, hours and li
   (R47.2).
 - Keep Project 8 current: stage, role, assignee, ETA, at-risk and escalation marks (R27, R51).
 - Run the gate and merge a fully cleared PR (assigned auditor's approval on the current head,
-  CI green, strict replay) under R41, R42 and R43, then post the next queued root (R47.5).
+  CI green, strict replay) under R41, R42 and R43, then merge and open the next wave (R53).
 - Fix what it has authority to fix (a missing mention, project, milestone or `Closes` link,
   the hand-off order); remind for the rest (a post outside the poster's role, a missing ETA)
   (R47.4).

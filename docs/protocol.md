@@ -448,7 +448,7 @@ that checks ran. External audit means the assigned auditor's approval on the
 current PR head under R23/R24, together with required GitHub checks; no distinct
 backend is required. Timeout and partial delivery never authorize merge.
 Self-host execution, policy-version gates, candidate creation, activation,
-re-exec, rollback and child health remain deferred to #29.
+re-exec, rollback and child health are out of scope (R18).
 
 Unknown State keys are ignored with one finding listing only their names. Snapshot
 loads preserve deep-copy isolation and the evidence-iteration migration.
@@ -463,7 +463,7 @@ What fridica-research does after each PR, and what the scaffold (R0) still does.
 | After | fridica-research does | scaffold still does |
 |---|---|---|
 | PR4 github | requests reviews, polls them, closes audit cards, merges fridica-research PRs | reads Slack, relays to the journal |
-| R2 bundle | provenance, clean diff classification, bounded GitHub acknowledgements, strict head binding and evidence replay | reads Slack and relays; self-host activation remains #29 |
+| R2 bundle | provenance, clean diff classification, bounded GitHub acknowledgements, strict head binding and evidence replay | reads Slack and relays; self-host activation is out of scope (R18) |
 
 ## Failure handling
 
@@ -572,9 +572,9 @@ fridica-research adopt T1:C0123456789:1700000000.000100 --issue 46 --repo chengc
   where escalation lives.
 
 Later slices, tracked on #46: PR adoption and polling, the ETA ladder and off-role reminders,
-merge with the next queued root, and the per-role AI opt-in.
+merge and open the next wave (R53), and the per-role AI opt-in.
 
-## Standing rules R15–R52 (#52, absorbs #28)
+## Standing rules R15–R53 (#52, absorbs #28)
 
 The owner's standing rules from iteration 3 onward, rewritten concisely. Every rule has exactly
 one status: **in force**, **superseded by Rn** (the later rule governs; the text is kept as
@@ -610,10 +610,10 @@ enforces the rule, or the issue that will; "by hand" means the floor manager doe
 - **R17. Study provenance and bootstrap policy.** Status: retired (#19, #22). The surviving
   fields (`generation`, `producer`, `subject`, `target`, `BootstrapPolicy`) are specified under
   Repository provenance above (`provenance.py`).
-- **R18. Candidate isolation.** Status: retired (#19, #22). Self-host implementers in
+- **R18. Candidate isolation.** Status: retired (#19, #23). Self-host implementers in
   `worktrees/candidate-R<n+1>`, promotion by restart. Self-host execution was dropped, not
-  deferred: #22 (and with it #29) was dropped by the floor manager (2026-10-11) as outside the
-  floor-manager scope.
+  deferred: #19 and PR #23 were dropped by the floor manager (2026-10-11) as outside the
+  floor-manager scope, and #29 was dropped with them as moot.
 - **R19. Canonical replay corpus.** Status: in force. Enforced by: `replay.py`,
   `tests/bootstrap/`, `fridica-research replay --strict` as the merge gate (section R19 above).
 - **R20. Three levels of self-modification and the N-1 auditor.** Status: retired (#19, #22).
@@ -633,7 +633,7 @@ enforces the rule, or the issue that will; "by hand" means the floor manager doe
   contract or finding, gets a board card, and is tracked to closed or merged. Substrate repos
   are level 3: the PR is reviewed by someone who did not write it. `research.toml` `[repos]`
   lists the repositories a study may touch. Enforced by: `[repos]` in `config.py`; the
-  `cross_repo` action is not in code (by hand).
+  `cross_repo` action is #66 (by hand until then).
   - *Amendment 1 (2026-10-04):* for repositories other than its own, the driver files issues and
     tracks their state on the board, and that is all: it never requests, chases or mirrors their
     reviews and never posts review asks for them; the owner merges them.
@@ -658,17 +658,17 @@ enforces the rule, or the issue that will; "by hand" means the floor manager doe
   from main after every merge and the next stage runs with it; the seed (R0) only does what the
   current generation cannot, and each PR's acceptance names the duty it takes over. Every stage
   post says which side did the work. Enforced by: the handover ledger (section R25 above), by hand.
-- **R26. Delegation, budgets and standing rules.** Status: in force. (1) The implementer of a PR
+- **R26. Delegation and standing rules.** Status: in force. (1) The implementer of a PR
   is never one of its reviewers. The original bullet (cards offered in the thread, `taking #N`,
   the driver's own worker taking a card after `offer_window`) was replaced: jobs go to the crew,
   assigned by the floor manager (R49); the
   driver's own AI worker takes a role a person holds only on an explicit per-role opt-in (R47.1).
-  (2) The driver tracks its budgets (per-study cost, the owner's session and credit limits);
-  below the low watermark it starts no new local workers and hands in-flight cards to the crew
-  with a hand-off note. (3) Every owner instruction given during a study is a standing rule:
+  (2) Every owner instruction given during a study is a standing rule:
   recorded with `fridica-research note`, written into this document by the next PR, applied from
-  the next stage. Enforced by: (1) `arbiter.py` roster refusal, (2) not in code (by hand),
-  (3) `note` / `machine.py` findings and this section.
+  the next stage. Enforced by: (1) `arbiter.py` roster refusal,
+  (2) `note` / `machine.py` findings and this section.
+  - *Decision (2026-10-11):* the former clause (2), the driver's AI budgets and the low
+    watermark, is retired (Cheng's ruling in Wave C); the former clause (3) is now (2).
 - **R27. Assignment invariant.** Status: in force. A card is `In Progress` only with exactly one
   assignee, set in the same transition; if the assignee cannot be set the card stays `Todo` with
   the login in `Workers` and one line asks the repository owner for access. Every transition
@@ -706,15 +706,13 @@ enforces the rule, or the issue that will; "by hand" means the floor manager doe
 
 ### PR cadence and per-PR threads (R35–R40)
 
-- **R35. One PR at a time.** Status: in force. Only one PR per study repository is in review at
-  once; the others stay draft in an ordered queue (order set by the owner) and the next is
-  promoted only after the active one merges. Enforced by: not in code; #46 slice 4 (merge and
-  next queued root).
+- **R35. One PR at a time.** Status: superseded by R53. Only one PR per study repository was in
+  review at once, the others waiting as drafts in an owner-ordered queue.
 - **R36. Two reviewers, either passes.** Status: superseded by R38. Each PR had exactly two
   reviewers (never its implementer), and one non-bot approval on the current head from either
   merged it.
-- **R37. One-day cadence and bundling.** Status: superseded by R49. A PR was projected at a flat
-  24 h with small changes bundled per day; job sizes and ETAs are now the floor manager's (R49).
+- **R37. One-day cadence.** Status: superseded by R49 and R53. A PR was projected at a flat
+  24 h; job sizes and ETAs are now the floor manager's (R49) and jobs run in waves (R53).
 - **R38. One thread and four roles per PR.** Status: in force (effective from PR #27). Each PR
   has its own root message and thread; each participant holds one persistent role (explorer,
   debater, implementer, auditor), rotated for the next PR; the auditor is the one reviewer and
@@ -771,15 +769,15 @@ enforces the rule, or the issue that will; "by hand" means the floor manager doe
   judgment calls recorded as findings, owner-only questions escalated, plus the per-PR roster
   and rotation, the R42/R43 overrides as logged commands, and ETA check-ins. Enforced by:
   `arbiter.py`; slice 1 merged as #51 (`d9f8cfb`); slices 2 (PR adoption and polling), 3 (ETA
-  ladder, R51) and 4 (merge and next queued root) on #46.
+  ladder, R51) and 4 (merge and open the next wave, R53) on #46.
 - **R47. fridica-research is the driver and arbitrator's tool.** Status: in force. The crew
   does not use it; their posts and GitHub actions are its inputs. People-run studies are the
   default (no AI worker for a person-held role, no command asked of a person); a stage advances
   as soon as it clears; ETAs are reminder deadlines, not start times; it fixes mistakes within
-  its authority and reminds otherwise; a fully cleared PR merges at once and the next queued
-  root follows. Enforced by: `arbiter.py`, `cli.py adopt` (section R47 above).
+  its authority and reminds otherwise; a fully cleared PR merges at once; once the wave's last PR merges, the floor
+  manager opens the next wave (R53). Enforced by: `arbiter.py`, `cli.py adopt` (section R47 above).
 
-### The floor manager (R48–R52)
+### The floor manager (R48–R53)
 
 - **R48. Floor manager, Innies and Outies.** Status: in force. The floor manager holds the
   driver and arbitrator role and holds no PR role. It divides the work into jobs, assigns each to
@@ -812,3 +810,8 @@ enforces the rule, or the issue that will; "by hand" means the floor manager doe
   after with its validation; score on each job's first committed ETA: mean absolute error, bias,
   late and early counts, reschedules, largest errors; delays and lessons), written by the floor
   manager when the last merge lands and posted in the wave's thread. Enforced by: by hand; #53.
+- **R53. Waves.** Status: in force. Jobs in a wave touch different files and run in parallel;
+  jobs that change Config never share a wave. Each PR runs the short track: implementer, then
+  the assigned auditor's GitHub review on the current head, then the floor manager merges. Each
+  wave closes with its R52 record. Supersedes R35 and, with R49, R37. Enforced by: by hand;
+  #46 slice 4 (merge and open the next wave).

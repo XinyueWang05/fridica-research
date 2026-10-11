@@ -1,7 +1,7 @@
 """Study provenance: producer is the running driver revision; subject identifies
 the input repository revision examined by this study, not an in-toto output subject.
 Target is a committed output revision, or None until one exists. Bootstrap fields
-describe intended policy only; activation and child-health execution belong to #29.
+describe intended policy only; self-host activation and child health are out of scope (R18).
 """
 from __future__ import annotations
 
