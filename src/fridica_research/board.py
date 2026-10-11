@@ -20,9 +20,11 @@ one-time setup). `Reviewers` is reserved by Projects v2, hence `Peer reviewers`.
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 import json
 import logging
 import os
+import re
 import subprocess
 from dataclasses import dataclass
 from typing import Callable
@@ -203,7 +205,27 @@ class Projects:
     def set_status(self, issue: int, key: str): self.set_option(issue, "Status", STATUS[key])  # R14: Status is built in, discovered like any field
     def edit_issue(self, number: int, *args: str): self.run(["gh", "issue", "edit", str(number), "-R", self.b.repo, *args], None)
     def close_issue(self, number: int): self.run(["gh", "issue", "close", str(number), "-R", self.b.repo], None)
-    def comment_issue(self, number: int, body: str): self.run(["gh", "issue", "comment", str(number), "-R", self.b.repo, "--body", body], None)
+    def comment_issue(self, number: int, body: str) -> int | None:
+        """Post a comment; its id, from the URL gh prints (`.../issues/N#issuecomment-ID`), or None if gh printed none."""
+        url = self.run(["gh", "issue", "comment", str(number), "-R", self.b.repo, "--body", body], None) or ""
+        m = re.search(r"#issuecomment-(\d+)", url)
+        return int(m.group(1)) if m else None
+
+    def login(self) -> str:
+        """The token's own account (`gh api user`), read once: the author of every comment the driver posts."""
+        if not getattr(self, "_login", None): self._login = json.loads(self.run(["gh", "api", "user"], None))["login"]
+        return self._login
+
+    def find_comment(self, number: int, marker: str) -> int | None:
+        """The id of the issue's oldest comment by the driver's own login whose text has `marker` followed by ` (`
+        (so study T:1 never matches T:10), from REST, every page; or None."""
+        from .github import json_values  # github imports this module
+        pages = json_values(self.run(["gh", "api", "--paginate", f"repos/{self.b.repo}/issues/{number}/comments?per_page=100"], None))
+        me = self.login().lower()
+        ids = [int(c["id"]) for page in pages for c in (page if isinstance(page, list) else [page]) if marker + " (" in (c.get("body") or "") and str((c.get("user") or {}).get("login", "")).lower() == me]
+        return min(ids) if ids else None
+
+    def update_comment(self, comment_id: int, body: str): self.run(["gh", "api", "-X", "PATCH", f"repos/{self.b.repo}/issues/comments/{comment_id}", "--input", "-"], json.dumps({"body": body}))
 
 
 # --- the study projection ----------------------------------------------------
@@ -310,12 +332,53 @@ class Board:
         self.api.set_status(number, "done")
         if close_issue: self.api.close_issue(number)
 
+    @staticmethod
+    def notes(state: State, cards: dict) -> str:
+        """The field-setup finding and the repeated mention misses, in the created body or the adoption comment."""
+        out = ""
+        if cards.get("field_setup_finding"): out += "\n\nFinding: " + cards["field_setup_finding"]
+        misses = {k: v for k, v in state.mention_misses.items() if v >= 2}
+        if misses: out += "\n\nRepeated handoff mention misses: " + json.dumps(misses, sort_keys=True)
+        return out
+
+    @staticmethod
+    def adoption_marker(state: State) -> str: return f"Adopted as the study card of fridica-research study {state.thread}"
+
+    def adoption_comment(self, state: State, n: int, cards: dict) -> str:
+        """#60: the one comment on an adopted issue carries what a created body does (timing, provenance, finding, misses); roles are in Workers."""
+        head = f"{self.adoption_marker(state)} (generation {state.generation}); stage cards link here as `Study: #{n}`. The driver never closes this issue; the PR's `Closes #{n}` does."
+        return head + "\n\n" + stage_table(state) + self.notes(state, cards)
+
+    def sync_comment(self, state: State, n: int, cards: dict):
+        """Post the adoption comment once, store its id, PATCH it when the text changes. A legacy card (`commented`, no id)
+        and a PATCH that 404s (the comment was deleted) look the driver's own marker comment up; a new comment is posted
+        only when none is found."""
+        text = self.adoption_comment(state, n, cards)
+        digest = hashlib.sha256(text.encode()).hexdigest()
+        if cards.get("comment_id") is not None and cards.get("comment_sha") != digest:
+            try:
+                self.api.update_comment(cards["comment_id"], text)
+                cards["comment_sha"] = digest
+                return
+            except RuntimeError as e:
+                if "HTTP 404" not in str(e): raise
+                log.warning("adoption comment %s on #%s is gone (404); looking it up again", cards["comment_id"], n)
+                cards["comment_id"], cards["comment_sha"] = None, None  # the stale id never 404s again
+        if cards.get("comment_id") is None and cards.get("commented"):
+            cards["comment_id"] = self.api.find_comment(n, self.adoption_marker(state))
+            if cards["comment_id"] is None: cards["commented"] = False
+            else:
+                self.api.update_comment(cards["comment_id"], text)
+                cards["comment_sha"] = digest
+                return
+        if cards.get("comment_id") is None:
+            cid = self.api.comment_issue(n, text)
+            cards["commented"], cards["comment_id"], cards["comment_sha"] = True, cid if cid is not None else self.api.find_comment(n, self.adoption_marker(state)), digest
+            self.remember(f"board:{state.thread}", json.dumps(cards))  # recorded at once: a later failure in this sync must not lose the id
+
     def sync_study(self, state: State, cards: dict):
         owner_login = self.login(self.cfg.owner, state)
-        body = stage_table(state) + "\n\n" + roles_table(holders(state, self.cfg))
-        if cards.get("field_setup_finding"): body += "\n\nFinding: " + cards["field_setup_finding"]
-        misses = {k: v for k, v in state.mention_misses.items() if v >= 2}
-        if misses: body += "\n\nRepeated handoff mention misses: " + json.dumps(misses, sort_keys=True)
+        body = stage_table(state) + "\n\n" + roles_table(holders(state, self.cfg)) + self.notes(state, cards)
         if "issue" not in cards:
             # `start --issue N` writes `issue:<channel>` while the driver serves: read live, never from a map built at startup
             given_key = next((k for k in (f"issue:{state.thread}", f"issue:{state.channel}") if self.recall(k)), None)
@@ -329,9 +392,7 @@ class Board:
             if cards.get("given") and owner_login: self.api.edit_issue(n, "--add-assignee", owner_login)
             cards["filled"] = self.fill_card(n, "driver", "Explore", state.started_at, state.projected_hours * 3600, state)
             if owner_login: self.api.set_text(n, "Owner", owner_login)
-        if cards.get("given") and not cards.get("commented"):  # once per adopted issue: recorded with the cards (store meta) after it was posted
-            self.api.comment_issue(n, f"Adopted as the study card of fridica-research study {state.thread} (generation {state.generation}); stage cards link here as `Study: #{n}`. The driver never closes this issue; the PR's `Closes #{n}` does.")
-            cards["commented"] = True
+        if cards.get("given"): self.sync_comment(state, n, cards)  # #60: one comment per adopted issue, its id with the cards
         if not cards.get("given"): self.api.edit_issue(n, "--body", body)  # #49: an adopted body is the maintainer's; stage and iteration are board fields
         self.api.set_option(n, "Stage", BOARD_STAGE.get(state.stage, state.stage))
         self.api.set_number(n, "Iteration", state.iteration)
