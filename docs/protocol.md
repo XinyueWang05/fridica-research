@@ -173,8 +173,9 @@ hours and Finished on delivery.
 
 Roles are this package's catalog. Complete role and study-overlay lens text travel inside
 briefs, never in an `instructions` body field. Local `lens_sha256` fingerprints lens text
-for structural replay (D2) and is stripped before contacting the host. `roles/driver.md`
-is CLI-listed policy, not a worker role; it can never be delegated. Every PR root body,
+for structural replay (D2) and is stripped before contacting the host. `roles/floor-manager.md`
+(the floor-manager charter, formerly `roles/driver.md`) is CLI-listed policy, not a worker
+role; it can never be delegated. Every PR root body,
 study issue and Workers field renders the same five-row roles table with holders; the
 study card has Role = driver.
 
@@ -565,3 +566,232 @@ fridica-research adopt T1:C0123456789:1700000000.000100 --issue 46 --repo chengc
 
 Later slices, tracked on #46: PR adoption and polling, the ETA ladder and off-role reminders,
 merge with the next queued root, and the per-role AI opt-in.
+
+## Standing rules R15–R52 (#52, absorbs #28)
+
+The owner's standing rules from iteration 3 onward, rewritten concisely. Every rule has exactly
+one status: **in force**, **superseded by Rn** (the later rule governs; the text is kept as
+history) or **retired (#issue)** (the issue closed the scope without the rule staying in force).
+Amendments and decisions sit under the rule they change. "Enforced by" names the code that
+enforces the rule, or the issue that will; "by hand" means the floor manager does it today.
+
+### Vocabulary and generations
+
+- **Innie**: an AI worker. **Outie**: the human behind an Innie. **Floor manager**: the AI that
+  holds the driver and arbitrator role; its charter is `roles/floor-manager.md`.
+  fridica-research is the floor manager's scheduling, monitoring and managing tool (R47, R48).
+- **Generations.** R0 is the seed (Cheng's Claude as driver, role subagents as workers, shell
+  scripts as board client), trusted by inspection and frozen once R1 is promoted. R1 is PR #8,
+  validated by R0's auditors (the N-1 rule) and deterministic tests. R2 is produced by R1 running
+  the self-host study on its own source, validated by R1's auditors, an external backend and the
+  replay corpus. R3 is produced by R2; the milestone is reached when R2 -> R3 finds no bootstrap
+  defect. Every study and delivery post records `producer: fridica-research@R<n> <sha>`,
+  `input_revision`, `candidate_revision` and `generation` (see Repository provenance).
+- **First external study after maturity**: chengcli/snapy#275 (well-balanced x1 reconstruction
+  for moist columns) with the same crew as peers, `bootstrap = None`, once PR1–PR5 are merged,
+  R1 -> R2 is promoted and fridica #130 gives the driver Slack and GPU placement.
+
+### Backends, protocol data, provenance, isolation, levels (R15–R20)
+
+- **R15. DriverBackend protocol.** Status: retired (#19, #22). A `backend/protocol.py` with a
+  bootstrap backend (subprocess `claude -p` / `codex exec` workers, journal-file posts) and a
+  fridica backend; the bootstrap runner duplicated fridica's worker supervision (#29).
+- **R16. Protocol as data.** Status: retired (#19, #22). Stages, workers, convergence and
+  transitions declared in `protocols/*.yaml` and interpreted by the engine.
+- **R17. Study provenance and bootstrap policy.** Status: retired (#19, #22). The surviving
+  fields (`generation`, `producer`, `subject`, `target`, `BootstrapPolicy`) are specified under
+  Repository provenance above (`provenance.py`).
+- **R18. Candidate isolation.** Status: retired (#19, #22). Self-host implementers in
+  `worktrees/candidate-R<n+1>`, promotion by restart; self-host execution is deferred to #29.
+- **R19. Canonical replay corpus.** Status: in force. Enforced by: `replay.py`,
+  `tests/bootstrap/`, `fridica-research replay --strict` as the merge gate (section R19 above).
+- **R20. Three levels of self-modification and the N-1 auditor.** Status: retired (#19, #22).
+  The classification utility survives as `levels.diff_level` (Repository provenance above).
+
+### Reviews, cross-repo work, hygiene, merge (R21–R24)
+
+- **R21. PR reviews are the sign-off.** Status: in force. When the deliverable is a PR, the
+  audit closes on the reviewer's GitHub review on the current head (APPROVED = approve,
+  CHANGES_REQUESTED = changes, COMMENTED = finding without verdict); the Slack `SIGN-OFF` line is
+  the fallback for reviewers without repository access, and each review is mirrored into the
+  thread as one line. Who is requested is narrowed to the PR's auditor by R38. Enforced by:
+  `github.py`, `contracts.parse_signoff` (section R21 above).
+- **R22. Cross-repo work is part of the protocol.** Status: in force. A study may file issues
+  and submit PRs on substrate and related repositories (fridica, fridica-core, pyharp, kintera,
+  snapy, ...). Each cross-repo issue carries the study thread, the board link and the exact
+  contract or finding, gets a board card, and is tracked to closed or merged. Substrate repos
+  are level 3: the PR is reviewed by someone who did not write it. `research.toml` `[repos]`
+  lists the repositories a study may touch. Enforced by: `[repos]` in `config.py`; the
+  `cross_repo` action is not in code (by hand).
+  - *Amendment 1 (2026-10-04):* for repositories other than its own, the driver files issues and
+    tracks their state on the board, and that is all: it never requests, chases or mirrors their
+    reviews and never posts review asks for them; the owner merges them.
+  - *Amendment 2 (2026-10-04):* the driver may submit PRs to other repositories; their own
+    process reviews them and the owner merges. The driver monitors such a PR (reviews, decision,
+    head, state) and on any change notifies the PR's implementer only, updates the card and
+    records a finding on changes requested; one thread line only when the implementer is crew.
+- **R23. PR hygiene.** Status: in force. Every PR links its issue (`Closes #N`), is added to the
+  study's project and carries the generation milestone; `[repos]` marks each repository
+  `merge = "driver"` (fridica-research) or `"owner"` (fridica, fridica-core, fridica-agent,
+  fridica-store-sqlite). Enforced by: `contracts.pr_body`, `contracts.pr_hygiene_missing`,
+  `github.py` (section R23 above).
+- **R24. Merge rule and late reviews.** Status: in force. The merge gate is a non-bot approval
+  on the current head (bots never count; the approver is the assigned auditor per R38/R41). A
+  changes-requested review after the merge is acknowledged once (reply, thread line), its items
+  become findings and are carried into the next PR's body. Enforced by: `github.py` (section
+  R24 above).
+
+### Handover, delegation, assignment, mentions (R25–R29)
+
+- **R25. Dogfooding and the scaffold handover.** Status: in force. fridica-research is installed
+  from main after every merge and the next stage runs with it; the seed (R0) only does what the
+  current generation cannot, and each PR's acceptance names the duty it takes over. Every stage
+  post says which side did the work. Enforced by: the handover ledger (section R25 above), by hand.
+- **R26. Delegation, budgets and standing rules.** Status: in force. (1) The implementer of a PR
+  is never one of its reviewers; jobs go to the crew, assigned by the floor manager (R49); the
+  driver's own AI worker takes a role a person holds only on an explicit per-role opt-in (R47.1).
+  (2) The driver tracks its budgets (per-study cost, the owner's session and credit limits);
+  below the low watermark it starts no new local workers and hands in-flight cards to the crew
+  with a hand-off note. (3) Every owner instruction given during a study is a standing rule:
+  recorded with `fridica-research note`, written into this document by the next PR, applied from
+  the next stage. Enforced by: (1) `arbiter.py` roster refusal, (2) not in code (by hand),
+  (3) `note` / `machine.py` findings and this section.
+- **R27. Assignment invariant.** Status: in force. A card is `In Progress` only with exactly one
+  assignee, set in the same transition; if the assignee cannot be set the card stays `Todo` with
+  the login in `Workers` and one line asks the repository owner for access. Every transition
+  re-checks the invariant. Enforced by: `board.py` (R13, R14 above), `arbiter.py` assignee moves.
+- **R28. ETA and check-back.** Status: superseded by R49. The assignee stated the ETA and the
+  driver checked back at it; now the floor manager sets the ETA (R49) and runs the ladder (R51).
+- **R29. Mentions.** Status: in force. A post that needs a person to act @-mentions exactly
+  that person, once per post; a plain name otherwise. Enforced by: `machine.check_handoff`,
+  `arbiter.py` (the one-fix-one-mention rule in section R47 above).
+
+### Roles and audit policy (R30–R34)
+
+- **R30. Role decision trees.** Status: retired (#25). Per-role trees with PUCT selection and
+  outcome backup; #25's useful core is re-scoped into the ETA estimator (#53).
+- **R31. Debater role with lenses.** Status: in force. Mathematician and physicist are lenses of
+  one `debater` role; a debate runs at least two lenses and converges when they agree. Enforced
+  by: `roles/__init__.py` (`ROLES`, `LENSES`), `machine.py` lens lanes (section The pipeline).
+- **R32. Layers and roles.** Status: in force. fridica-core holds general mechanism only; roles,
+  role prose, stance vocabulary and defaults are research policy owned here (#26); the auditor
+  checks layer boundaries. Enforced by: Repository charters above, `roles/auditor.md`.
+- **R33. First-pass author fixes.** Status: in force. Any revision, in review or after merge,
+  goes to whoever did the first pass; the card is reassigned only if that author declines or
+  misses two ETAs (then rescheduled under R51). Enforced by: `roles/implementer.md`, R24 carry
+  in `github.py`; routing by hand.
+- **R34. Auditor rule set v2.** Status: in force. Reuse before build (search sibling repos and
+  lower layers; duplicated source of truth needs a contract decision), audit the design and not
+  only the code, report the class and invariant and not only the instance, fakes match real tool
+  output, blocking means medium or higher (lows go to a follow-up issue owned by the first-pass
+  author), three rounds before escalating to the owner; the explorer brief asks what sibling
+  repos provide. Enforced by: `roles/auditor.md`, `briefs.py`.
+  - *Decision (2026-10-05):* auditor v2 core rules 4, 9, 11, 16, 17, 18, 21, 22, 23 restored;
+    Tianhao's wording kept for 1, 24, 25, 28; severity bar and three-round limit kept; PR #23's
+    runner direction deferred to the owner (closed as #29).
+
+### PR cadence and per-PR threads (R35–R40)
+
+- **R35. One PR at a time.** Status: in force. Only one PR per study repository is in review at
+  once; the others stay draft in an ordered queue (order set by the owner) and the next is
+  promoted only after the active one merges. Enforced by: not in code; #46 slice 4 (merge and
+  next queued root).
+- **R36. Two reviewers, either passes.** Status: superseded by R38.
+- **R37. One-day cadence and bundling.** Status: superseded by R49. A PR was projected at a flat
+  24 h with small changes bundled per day; job sizes and ETAs are now the floor manager's (R49).
+- **R38. One thread and four roles per PR.** Status: in force (effective from PR #27). Each PR
+  has its own root message and thread; each participant holds one persistent role (explorer,
+  debater, implementer, auditor), rotated for the next PR; the auditor is the one reviewer and
+  their approval on the current head merges. Enforced by: section PR discussion and role
+  jurisdiction above, `github.py` single-auditor request, `arbiter.py` roster.
+- **R39. Gaps become issues.** Status: in force. A gap (rule not in code, deferred finding,
+  missing definition, duplicated mechanism, untaken dependency) becomes an issue in the owning
+  repository at once, with evidence, an owner and a board card; chat, a PR body or an untracked
+  file is not a record. Enforced by: by hand; `roles/auditor.md`.
+- **R40. Jurisdiction.** Status: in force. Explorer reports what exists and is missing; debater
+  posts lens findings and a summary; only the implementer commits; only the auditor reviews on
+  GitHub and decides. Anything else is input in the PR thread; other accounts' GitHub reviews do
+  not count for the merge and become findings. Enforced by: `github.py`, the role files.
+  - *Amendment (2026-10-05):* every role file states its jurisdiction; the implementer runs no
+    debater or auditor passes and posts no GitHub review; the driver refuses a delegation that
+    gives one person two roles on the same PR.
+
+### Merge authority and overrides (R41–R43)
+
+- **R41. Merge authority and branch protection.** Status: in force. The driver merges a
+  fridica-research PR once its assigned auditor approves the current head; main requires one
+  approval, dismisses stale approvals, requires approval of the last push and the CI jobs.
+  Enforced by: `github.py` merge, GitHub branch protection.
+- **R42. Explicit-ask fallback.** Status: in force. If the auditor cannot review on GitHub, the
+  driver asks in the PR thread "approve #N at <full sha>?", and the auditor's SIGN-OFF line for
+  that sha lets the driver merge with admin rights, CI green, head unmoved; any push needs a new
+  ask. Enforced by: by hand; #46 (logged driver command).
+- **R43. CI override after three external failures.** Status: in force. A required check that
+  fails three times for an external reason (no runner, cancelled before any step, outage; never
+  a test, lint or build failure) may be merged past, with every other check green and the
+  auditor's approval standing; the attempts are recorded in the merge commit, on the board and
+  in the CI-reliability issue. Enforced by: by hand; #46 (logged driver command).
+
+### Pipeline and the driver (R44–R47)
+
+- **R44. Sequential role pipeline.** Status: in force. Explorer (literature and prior art,
+  sourced findings, not audited) -> debater (lenses, may add or edit lenses, ends in consensus)
+  -> implementer (the consensus only) -> auditor (scope against the consensus). Enforced by:
+  `machine.py`, `briefs.py` (section The pipeline).
+  - *Revision (2026-10-05):* the auditor has two checkpoints: a design audit of the consensus
+    before implementation (a return goes back to the debater) and a code audit after it. Order:
+    explorer -> debater -> auditor (design) -> implementer -> auditor (code).
+  - *Addition (2026-10-05):* the debater may ask the explorer for more evidence before its
+    consensus; the debate -> explore -> debate loop is recorded and bounded by the stage time.
+- **R45. Driver and arbitrator.** Status: superseded by R48. The driver and arbitrator holds
+  none of the four PR roles, drives (threads, roles, hand-offs, board, ETAs, replay gate, merge)
+  and arbitrates (disagreements, unclear rules, jurisdiction), escalating owner-only decisions.
+  R48 names this holder the floor manager and adds the Innie -> floor manager -> Outie path; the
+  `driver and arbitrator` row of the Roles table is unchanged.
+- **R46. The driver and arbitrator becomes a component.** Status: in force. Fixing what each
+  round runs into is the driver and arbitrator's job, done by fridica-research code rather than
+  by hand: an arbiter fold beside `machine.py` (thread events in; posts, rulings, issues, board
+  updates, reminders and escalations out; pure and replayable), mechanical checks as code and
+  judgment calls recorded as findings, owner-only questions escalated, plus the per-PR roster
+  and rotation, the R42/R43 overrides as logged commands, and ETA check-ins. Enforced by:
+  `arbiter.py`; slice 1 merged as #51 (`d9f8cfb`); slices 2 (PR adoption and polling), 3 (ETA
+  ladder, R51) and 4 (merge and next queued root) on #46.
+- **R47. fridica-research is the driver and arbitrator's tool.** Status: in force. The crew
+  does not use it; their posts and GitHub actions are its inputs. People-run studies are the
+  default (no AI worker for a person-held role, no command asked of a person); a stage advances
+  as soon as it clears; ETAs are reminder deadlines, not start times; it fixes mistakes within
+  its authority and reminds otherwise; a fully cleared PR merges at once and the next queued
+  root follows. Enforced by: `arbiter.py`, `cli.py adopt` (section R47 above).
+
+### The floor manager (R48–R52)
+
+- **R48. Floor manager, Innies and Outies.** Status: in force. The floor manager holds the
+  driver and arbitrator role and holds no PR role. It divides the work into jobs, assigns each to
+  an Innie with an ETA, tracks progress on Project 8 and checks in regularly. An Innie reports
+  any problem to the floor manager first; the floor manager arbitrates and escalates to that
+  Innie's Outie only when it cannot; owner-only questions (merge authority, scope, rules) go to
+  Cheng. The floor manager is scored on ETA accuracy and optimizes that score. Enforced by:
+  `roles/floor-manager.md`; the Innie/Outie register is #54, the scoring #53.
+- **R49. The floor manager sets the ETA.** Status: in force. The Innie does not set it; every
+  ETA rests on reasoning, historical data or a trial run, with small estimating sub-agents when
+  needed, and every job is kept in a job ledger. Enforced by: by hand today (the floor manager's
+  local ledger); `eta.py` and the ledger are #53.
+- **R50. Fresh workload report before an ETA.** Status: in force. The floor manager asks each
+  Innie for its current workload (reachable machines and slots, jobs in progress and queued,
+  limits such as rate limits, offline windows and Outie sign-offs) before committing an ETA;
+  an ETA without a fresh report is provisional. Snapshots go to a `workload` table. Enforced by:
+  by hand; #53, #54.
+- **R51. Missed-ETA ladder, generic.** Status: in force. Acts on observed signals (deliverable,
+  liveness, response), never a guessed cause; each step fires once per job with a `ref:` line;
+  window W = clamp(25% of estimated hours, 15 min, 60 min): checkpoint at acceptance, check-in at
+  the ETA, re-estimate or arbitrate on a reply, reschedule on silence or a second miss, the owner
+  when rescheduling is impossible. Causes are recorded only as reported; every miss is a ledger
+  row and counts against the floor manager (R48). Enforced by: #46 slice 3, #53.
+  - *Amendment (2026-10-11 15:00 ET):* Outies are not a fallback for a missed deadline. An Outie
+    is brought in only for a permission, hardware or internet blocker its Innie reports; silence
+    leads to rescheduling, not to the Outie.
+- **R52. Wave record and score.** Status: in force. Every wave or round closes with a record in
+  a `waves` ledger table (identity, crew and jobs; issues, PRs and merge shas, main before and
+  after with its validation; score on each job's first committed ETA: mean absolute error, bias,
+  late and early counts, reschedules, largest errors; delays and lessons), written by the floor
+  manager when the last merge lands and posted in the wave's thread. Enforced by: by hand; #53.
