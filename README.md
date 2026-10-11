@@ -2,7 +2,9 @@
 
 Research role policy is packaged in `src/fridica_research/roles/`. Run
 `fridica-research roles` to list the roles and the debater's lenses. Each delegation carries the selected role and study lens text inside its brief; the host body
-contains only supported delegation fields. The driver and arbitrator is policy, never delegated.
+contains only supported delegation fields. The driver and arbitrator is policy, never delegated: it is the floor manager, the AI that
+schedules, tracks and arbitrates the crew's jobs (AI workers are Innies, the human behind each is
+its Outie); its charter is `roles/floor-manager.md`.
 
 The auto-research stage machine and driver for [fridica](https://github.com/chengcli/fridica)
 (chengcli/fridica#126). A study is a root post in a research channel; the driver runs
@@ -123,7 +125,8 @@ Needs fridica with the #126 external-driver surface (PR B: `POST /threads/<id>/d
 - `briefs.py` + `schemas/`: brief templates and the three LLM JSON schemas, with a size guard.
 - `driver.py`, `client.py`, `store.py`, `board.py`, `config.py`, `cli.py`.
 - `github.py`: GitHub reviews as the sign-off, PR hygiene, the driver-side merge, post-merge acknowledgement.
-- [docs/protocol.md](docs/protocol.md): the protocol (R1-R14, R19, R21, R23, R24) as the driver runs it.
+- [docs/protocol.md](docs/protocol.md): the protocol (R1-R14, R19, R21, R23, R24) as the driver runs it,
+  and the standing rules R15-R52, each with its status.
 
 ## First study
 
