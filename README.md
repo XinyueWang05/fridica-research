@@ -126,7 +126,7 @@ Needs fridica with the #126 external-driver surface (PR B: `POST /threads/<id>/d
 - `driver.py`, `client.py`, `store.py`, `board.py`, `config.py`, `cli.py`.
 - `github.py`: GitHub reviews as the sign-off, PR hygiene, the driver-side merge, post-merge acknowledgement.
 - [docs/protocol.md](docs/protocol.md): the protocol (R1-R14, R19, R21, R23, R24) as the driver runs it,
-  and the standing rules R15-R52, each with its status.
+  and the standing rules R15-R53, each with its status.
 
 ## First study
 
