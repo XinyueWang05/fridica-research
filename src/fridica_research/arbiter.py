@@ -269,7 +269,8 @@ def hygiene(r: Round, p: dict) -> list[Action]:
     missing = contracts.pr_hygiene_missing(p.get("body") or "")
     finding = f"PR #{r.pr['number']} lacks the R23 lines: {', '.join(missing)}"
     if not missing or finding in r.findings: return []
-    return blocking(r, finding, f"hygiene/{r.pr['number']}", (r.holders("implementer") or [""])[0])
+    gaps = "+".join(re.sub(r"\W+", "-", g.lower()).strip("-") for g in missing)  # the gap list is in the key: a changed list posts again
+    return blocking(r, finding, f"hygiene/{r.pr['number']}/{gaps}", (r.holders("implementer") or [""])[0])
 
 
 def approved(r: Round) -> bool:
@@ -415,7 +416,8 @@ def polled(r: Round, ev: Event, cfg: Config) -> tuple[Round, list[Action]]:
             return r, []
         r.pr.pop("candidate", None)
         r.pr.update({"number": int(p["number"]), "head": p.get("headRefOid", ""), "state": p.get("state", "OPEN"), "draft": bool(p.get("isDraft"))})
-        actions += hygiene(r, p)
+        read = p
+    else: read = {}
     moved = False
     if ev.get("view"):
         v = ev["view"]
@@ -424,13 +426,14 @@ def polled(r: Round, ev: Event, cfg: Config) -> tuple[Round, list[Action]]:
         for k, bad in (("mergeable", ("CONFLICTING",)), ("checks", ("FAILURE", "PENDING"))):  # #90: a view without the field does not block
             if k in v: r.pr[k] = v[k]
             elif str(r.pr.get(k) or "").upper() in bad: r.pr.pop(k)
-        if r.pr.get("number"): actions += hygiene(r, v)
+        if "body" in v: read = v
         if str(v.get("state", "")).upper() == "CLOSED" and not v.get("mergedAt"):
             # closed without merging: drop it, keep the stage, and let the next poll adopt the implementer's next open PR
             n = r.pr["number"]
             r.pr = {}
             actions = blocking(r, f"{r.stage}: PR #{n} was closed without merging; dropped, stage not moved", f"closed/{n}", (r.holders("implementer") or [""])[0])
             return r, actions
+    actions += hygiene(r, read)  # after the closed check: a PR dropped as closed queues no hygiene post
     if ev.get("reviews") is not None:
         auditors = {r.login("auditor", cfg).lower()} - {""}
         verdicts = [v for k, v in latest_verdicts(ev["reviews"]).items() if k in auditors]

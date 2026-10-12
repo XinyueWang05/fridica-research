@@ -98,10 +98,29 @@ def test_a_hygienic_pr_gets_no_post():
 
 
 def test_a_missing_body_field_is_no_gap():
-    p = pr()
-    p.pop("body")
     r, a1 = poll(rnd(pr={"number": 95, "head": HEAD, "state": "OPEN"}), view={"headRefOid": HEAD, "state": "OPEN"})
     assert texts(a1) == [] and not any("hygiene" in f for f in r.findings)
+
+
+def test_fixing_one_of_two_gaps_posts_the_remaining_gap_once():
+    two = "Closes #91\nStudy thread: 1700000000.000100"  # lacks the board link and the milestone
+    r, a1 = poll(rnd(), prs=[pr(body=two)])
+    r, a2 = poll(r, view={"headRefOid": HEAD, "state": "OPEN", "body": two + "\nMilestone: R2"})
+    r, a3 = poll(r, view={"headRefOid": HEAD, "state": "OPEN", "body": two + "\nMilestone: R2"})
+    assert len(texts(a1)) == 1 and "board link" in texts(a1)[0] and "milestone" in texts(a1)[0]
+    assert len(texts(a2)) == 1 and "board link" in texts(a2)[0] and "milestone" not in texts(a2)[0] and texts(a3) == []
+    assert len({p["id"] for p in r.pending}) == 2
+
+
+def test_a_closed_view_queues_no_hygiene_post():
+    r, actions = poll(rnd(pr={"number": 95, "head": HEAD, "state": "OPEN"}), view={"headRefOid": HEAD, "state": "CLOSED", "body": "Refs #91"})
+    assert not r.pr.get("number") and not any("R23" in t for t in texts(actions))
+    assert not any("R23" in p["text"] for p in r.pending) and {p["id"] for p in r.pending} == {a.id for a in actions if a.kind == "post"}
+
+
+def test_adopted_then_closed_in_one_poll_queues_no_hygiene_post():
+    r, actions = poll(rnd(), prs=[pr(body="Refs #91")], view={"headRefOid": HEAD, "state": "CLOSED"})
+    assert not any("R23" in p["text"] for p in r.pending) and {p["id"] for p in r.pending} == {a.id for a in actions if a.kind == "post"}
 
 
 # -- (3) approved_at is the approving review's submitted_at, tied to its head ----------------
