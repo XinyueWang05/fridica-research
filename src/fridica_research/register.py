@@ -1,10 +1,11 @@
 """R48 (#54, absorbing #42): the register of Innies and their Outies, read from `[innie.<name>]` TOML tables.
 
 One table per Innie. Required: `outie` (the escalation target), `slack` (the Innie's Slack user id)
-and `github` (its GitHub login). Optional: `host`, `hardware`, `client`, `plan`, `slots` (concurrent
-jobs, an integer >= 1), `hours` and `offline` (a window as `HH:MM-HH:MM`), and `limits` (a string or a
-list of strings: fork-only pushes, missing token scopes, no review rights, ...). An unknown field, a
-duplicate Innie name, a duplicate Slack id or a duplicate GitHub login is a `RegisterError`.
+and `github` (its GitHub login). Optional: `host`, `hardware`, `client` (or its alias `backend`, the
+ledger's word; setting both is an error), `plan`, `slots` (concurrent jobs, an integer >= 1), `hours`
+and `offline` (a window as `HH:MM-HH:MM`, never zero-length), and `limits` (a string or a list of
+strings: fork-only pushes, missing token scopes, no review rights, ...). An unknown field, a duplicate
+Innie name, a duplicate Slack id or a duplicate GitHub login is a `RegisterError`.
 
 The register is the single source for the arbiter's roster (`arbiter.parse_roster` refuses a Slack id
 or a `--login` it does not list, when `Config.register` is set), for the escalation path of slice 3
@@ -34,6 +35,7 @@ from pathlib import Path
 
 REQUIRED = ("outie", "slack", "github")
 OPTIONAL = ("host", "hardware", "client", "plan", "slots", "hours", "offline", "limits")
+ALIASES = {"backend": "client"}  # alias -> field; the ledger's `innies.backend` names what the register calls `client`
 FIELDS = REQUIRED + OPTIONAL
 WINDOW = re.compile(r"^(?P<a>[0-2]\d):(?P<b>[0-5]\d)-(?P<c>[0-2]\d):(?P<d>[0-5]\d)$")
 SLACK_ID = re.compile(r"^[UW][A-Z0-9]{2,}$")
@@ -44,11 +46,13 @@ class RegisterError(ValueError):
 
 
 def window(value: str, what: str) -> tuple[int, int]:
-    """`HH:MM-HH:MM` -> (start, end) in minutes of the day; an end before the start wraps past midnight (`23:00-09:00`)."""
+    """`HH:MM-HH:MM` -> (start, end) in minutes of the day; an end before the start wraps past midnight (`23:00-09:00`).
+    An end equal to the start is refused: it would be read as an empty window, not a whole day."""
     m = WINDOW.match(str(value).strip())
     if not m: raise RegisterError(f"{what}: expected HH:MM-HH:MM, got {value!r}")
     a, b, c, d = (int(m.group(k)) for k in "abcd")
     if a > 23 or c > 23: raise RegisterError(f"{what}: hour out of range in {value!r}")
+    if (a, b) == (c, d): raise RegisterError(f"{what}: zero-length window {value!r}")
     return a * 60 + b, c * 60 + d
 
 
@@ -93,6 +97,8 @@ class Register:
 
 def _innie(name: str, raw) -> Innie:
     if not isinstance(raw, dict): raise RegisterError(f"[innie.{name}] must be a table")
+    if both := [f"{field} or {alias}" for alias, field in ALIASES.items() if alias in raw and field in raw]: raise RegisterError(f"[innie.{name}]: set {', '.join(both)}, not both")
+    raw = {ALIASES.get(k, k): v for k, v in raw.items()}
     if unknown := sorted(set(raw) - set(FIELDS)): raise RegisterError(f"[innie.{name}]: unknown field(s) {', '.join(unknown)}; fields are {', '.join(FIELDS)}")
     if missing := [k for k in REQUIRED if not str(raw.get(k, "")).strip()]: raise RegisterError(f"[innie.{name}]: missing {', '.join(missing)}; outie, slack and github are required")
     for k in ("outie", "slack", "github", "host", "hardware", "client", "plan", "hours", "offline"):

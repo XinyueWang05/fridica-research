@@ -1,8 +1,11 @@
 """#53 PR 1: the job ledger and its idempotent importer.
 
-The schema under test is the prototype DDL from issue #53 (comment 6113435186,
-2026-10-11T20:31:57Z), which `ledger.DDL` holds verbatim. Every row here is synthetic: the
-floor manager's real `jobs.sqlite3` stays local and is never read by a test.
+The schema under test is `ledger.DDL`: the prototype DDL from issue #53 (comment 6113435186,
+2026-10-11T20:31:57Z) plus the four usage columns the R50 amendment (#54) adds to `workload`
+after `offline`, so it is no longer the comment's text verbatim. A fresh ledger has the columns
+in DDL order; a ledger file created before the amendment gains them on `connect`, appended after
+`recorded` (SQLite's `ADD COLUMN` cannot insert). Every row here is synthetic: the floor
+manager's real `jobs.sqlite3` stays local and is never read by a test.
 """
 import re
 import sqlite3
@@ -61,6 +64,29 @@ def test_the_five_tables_are_created(db):
 @pytest.mark.parametrize("table", ledger.TABLES)
 def test_every_column_of_the_issue_ddl_is_present_in_order(db, table):
     assert ledger.columns(db, table) == ddl_columns(table)
+
+
+WORKLOAD_BEFORE_R50 = ["id", "innie", "asked_at", "reported_at", "machines", "slots", "in_progress", "queued", "limits", "offline", "source", "recorded"]
+USAGE = ["session_usage", "session_reset", "weekly_usage", "weekly_reset"]
+
+
+def test_a_fresh_ledger_has_the_workload_columns_in_ddl_order(db):
+    assert ledger.columns(db, "workload") == [*WORKLOAD_BEFORE_R50[:10], *USAGE, "source", "recorded"]
+    assert [c for c, _ in ledger.USAGE_COLUMNS] == USAGE
+
+
+def test_a_migrated_ledger_appends_the_usage_columns_after_recorded(tmp_path):
+    path = tmp_path / "old.sqlite3"
+    old = sqlite3.connect(str(path), isolation_level=None)
+    old.executescript(re.sub(r"offline TEXT, session_usage REAL, session_reset TEXT, weekly_usage REAL, weekly_reset TEXT,", "offline TEXT,", ledger.DDL))
+    old.close()
+    db = ledger.connect(path)
+    assert ledger.columns(db, "workload") == [*WORKLOAD_BEFORE_R50, *USAGE]
+    assert {t: ledger.columns(db, t) for t in ledger.TABLES if t != "workload"} == {t: ddl_columns(t) for t in ledger.TABLES if t != "workload"}
+    db.close()
+    again = ledger.connect(path)  # a second connect migrates nothing more
+    assert ledger.columns(again, "workload") == [*WORKLOAD_BEFORE_R50, *USAGE]
+    again.close()
 
 
 @pytest.mark.parametrize("table,key", ledger.KEYS.items())
