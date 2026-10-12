@@ -11,11 +11,12 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import subprocess
 import time
 from typing import Callable
 
-from . import arbiter, briefs, contracts, github, machine, provenance, wave as wave_mod
+from . import arbiter, briefs, contracts, deputy, github, ladder, machine, provenance, wave as wave_mod
 from .client import Client, ControlError, Unavailable
 from .config import Config
 from .machine import Action, Event, State
@@ -23,6 +24,8 @@ from .store import Store
 
 log = logging.getLogger("fridica_research.driver")
 LlmRunner = Callable[[str, str], dict]  # (schema name, prompt) -> payload
+ETA_FIELD = "ETA"  # the board text field a wave job's `dates["eta_text"]` goes to (#110); `Board.set_dates` takes dates only
+NOT_FOUND = re.compile(r"could not resolve to a pullrequest|no pull requests? found|http 404", re.I)  # gh's answers for a PR number that is not a PR; never a bare "not found"
 GH_FAILING_PASSES = 3  # consecutive wave polling passes with a failed GitHub read before the owner is told (#85)
 
 
@@ -311,6 +314,7 @@ class Driver:
         if w is None: return False
         ev = round_event(e, self.clock())
         if ev is not None: self.wave_event(w, ev)
+        self.note_reply(w, str(e.get("sender") or ""))
         return True
 
     def wave_event(self, w: wave_mod.Wave, ev: Event) -> wave_mod.Wave:
@@ -357,11 +361,15 @@ class Driver:
                 now = self.clock()
                 if now < self.last_poll.get((thread, n), float("-inf")) + self.cfg.github.poll_interval: continue
                 self.last_poll[(thread, n)], reads = now, reads + 1
+                had = rnd.pr.get("candidate")
                 try: ev = self.read_pr(rnd, run)
                 except Exception as e:  # noqa: BLE001 - a GitHub read never stalls a wave; the next pass reads again
                     log.warning("pr read for wave %s job %d failed: %s", thread, n, e)
                     error = error or e
                     continue
+                if had and "candidate" not in rnd.pr:  # read_pr dropped a not-found candidate; `rnd.pr` may be `w`'s own dict, so always save
+                    (w.jobs[n - 1].round.get("pr") or {}).pop("candidate", None)  # `w` is the latest fold, not the wave this loop started from
+                    self.save_wave(w)
                 if ev is None: continue
                 view = ev.get("view") or {}
                 if view.get("state") == "MERGED":
@@ -376,6 +384,96 @@ class Driver:
                 w = self.wave_event(w, ev)
                 self.request_review(w, n, run)
             if reads: self.count_gh_failure(w, error)
+
+    # -- the R51 ladder for wave jobs (#83, #80, #92, #88) ---------------------------
+    def ladder_key(self, thread: str, n: int) -> str: return f"ladder:{wave_mod.job_thread(thread, n)}"
+
+    def ladder_meta(self, thread: str, n: int) -> dict:
+        raw = self.store.get_meta(self.ladder_key(thread, n))
+        return json.loads(raw) if raw else {}
+
+    def save_ladder(self, thread: str, n: int, m: dict): self.store.set_meta(self.ladder_key(thread, n), json.dumps(m, sort_keys=True))
+
+    @staticmethod
+    def ladder_stage(j: wave_mod.Job) -> tuple[str, str, float | None, float | None, bool]:
+        """(stage, holder, eta, start, deliverable): the implementer toward `pr_eta` until a PR is recorded, then the auditor toward `review_eta`."""
+        if not (j.round.get("pr") or {}).get("number") and "pr" not in j.delivered:
+            return "pr", j.person("implementer").get("slack", ""), j.pr_eta, j.input_at, False
+        return "review", j.person("auditor").get("slack", ""), j.review_eta, j.delivered.get("pr", j.input_at), "review" in j.delivered
+
+    def note_reply(self, w: wave_mod.Wave, sender: str):
+        """`last_reply` on the driver clock for each open job the sender holds (the Slack ts is not compared with driver times)."""
+        if not sender or sender == self.cfg.owner: return
+        for n, j in enumerate(w.jobs, 1):
+            m = self.ladder_meta(w.thread, n)
+            if j.terminal or not m or m.get("key", [None, None])[1] != sender: continue
+            m["last_reply"] = self.clock()
+            self.save_ladder(w.thread, n, m)
+
+    def tick_waves(self):
+        """One ladder step per open job of each open wave, after `poll_waves`. The state lives in `ladder:<thread>:job<N>`,
+        keyed on (stage, holder, eta); a new key resets `done` and `checkin_at`. Besides the ETA rungs: one deputy wake per
+        `Round.held` post still held W after it (#92), and one nudge to the job's auditor when their Slack SIGN-OFF approve
+        has no approving GitHub review on the head (#88). An action that fails stays out of `done` and is tried next pass."""
+        now = self.clock()
+        for thread in self.waves():
+            w = self.load_wave(thread)
+            if w is None or w.closed_at is not None: continue
+            for n, j in enumerate(w.jobs, 1):
+                if j.terminal: continue
+                stage, holder, eta, start, deliverable = self.ladder_stage(j)
+                if not holder or eta is None: continue
+                m, key = self.ladder_meta(thread, n), [stage, holder, eta]
+                if m.get("key") != key: m = {**m, "key": key, "done": [], "checkin_at": None}
+                est = max(float(eta) - float(start if start is not None else eta), 0.0)
+                v = ladder.JobView(ref=f"fm-wave-{w.name}-job{n}", holder=holder, owner=self.cfg.owner, est=est, eta=float(eta), deliverable=deliverable,
+                                   checkin_at=m.get("checkin_at"), last_reply=m.get("last_reply"), done=frozenset(m.get("done") or ()), thread=thread)
+                actions = ladder.step(v, now) + self.held_wakes(v, j, now) + self.review_nudge(v, j)
+                for a in actions:
+                    if a.id in m["done"] or self.execute_ladder(thread, a): continue
+                    m["done"] = m["done"] + [a.id]
+                    if a.id == f"{v.ref}/checkin": m["checkin_at"] = now
+                self.save_ladder(thread, n, m)
+
+    @staticmethod
+    def held_wakes(v: ladder.JobView, j: wave_mod.Job, now: float) -> list[Action]:
+        """#92: a blocking finding is an entry in `Round.held`; W runs from the held post's ts, one wake per held post."""
+        out = []
+        for stage, h in sorted((j.round.get("held") or {}).items()):
+            try: at = float(h.get("ts"))
+            except (TypeError, ValueError): continue
+            if now > at + ladder.window(v.est):
+                out.append(ladder.wake(v, f"{v.ref}/held/{h.get('ts')}", f"{stage} is held since {h.get('ts')}: {str(h.get('text', ''))[:300]}", {"stage": stage}))
+        return [a for a in out if a.id not in v.done]
+
+    @staticmethod
+    def review_nudge(v: ladder.JobView, j: wave_mod.Job) -> list[Action]:
+        """#88: the job's auditor (and only them) signed off approve on the head in Slack, but GitHub has no approving review there."""
+        rnd, aud = j.rnd(), j.person("auditor").get("slack", "")
+        head = str(rnd.pr.get("head") or "")
+        if not aud or not head or arbiter.approved(rnd): return []
+        if not any(so.get("sender") == aud and so.get("verdict") == "approve" and head.startswith(str(so.get("sha") or "-")) for so in rnd.pr.get("signoffs") or []): return []
+        ref = f"{v.ref}/gh-review/{head[:12]}"
+        text = f"<@{aud}> your SIGN-OFF approve on PR #{rnd.pr.get('number')} is in Slack, but GitHub has no approving review at {head[:12]}. Please submit it on GitHub."
+        return [] if ref in v.done else [Action("post", ref, {"thread": v.thread, "post_kind": ladder.POST_KIND, "to": aud, "text": f"{text}\nref: {ref}"})]
+
+    def execute_ladder(self, thread: str, a: Action) -> str | None:
+        """A ladder action: `wake_deputy` as an instruct with its client id; every other kind (`notify_owner` included,
+        whose text already mentions the owner) as a plain post of its text, probed by its `ref:` first. None when done."""
+        try:
+            if a.kind == "wake_deputy":
+                try: deputy.wake(self.client, a.get("thread") or thread, a.id, a["text"])
+                except Exception as e:  # noqa: BLE001 - a wake that did not go out stays out of `done`: the next pass tries it again
+                    log.warning("ladder wake %s failed: %s", a.id, e)
+                    return f"wake_deputy {a.id} failed: {e}"
+                return None
+            seen = self.posted_with_ref(thread, a.id)
+            if seen is None: return f"{a.kind} {a.id} skipped: the ref probe failed"
+            if not seen: self.client.post_message(thread, contracts.PostRequest(a.get("post_kind") or ladder.POST_KIND, a["text"]))
+        except ControlError as e:
+            log.warning("ladder %s %s failed: %s", a.kind, a.id, e)
+            return f"{a.kind} {a.id} refused: {e}"
+        return None
 
     def unwatched_merge(self, rnd: arbiter.Round, run, ev: Event, n: int, opened_at: float | None) -> Event:
         """#91: adoption found nothing, so look for the job's PR that merged while nobody was watching: MERGED at or after
@@ -455,11 +553,28 @@ class Driver:
                 if a.kind not in arbiter.DURABLE: self.execute_round(rnd, a)
 
     def read_pr(self, rnd: arbiter.Round, run) -> Event | None:
+        """`pr_polled` for the round. With no PR recorded: the candidate's view first (job 4's candidate may be another author's
+        PR, which `list_prs --author` would miss); when it cannot be adopted (closed, another author, no Closes/Refs line) or its
+        view fails, the implementer's own listing follows on the same pass, after the view, so the arbiter can still say why the
+        candidate was not adopted. A not-found candidate is dropped from `rnd.pr`; the caller saves that."""
         now = self.clock()
+        cand: list[dict] = []
+        if not rnd.pr.get("number") and rnd.pr.get("candidate"):
+            n = int(rnd.pr["candidate"])  # the adoption fields (`LIST_FIELDS`: number, author, body, ...): `view_pr` reads no body
+            try:
+                view = json.loads(run(["gh", "pr", "view", str(n), "-R", rnd.repo, "--json", github.LIST_FIELDS], None) or "{}")
+                view.setdefault("number", n)
+                cand = [view]
+                if arbiter.pick_pr(rnd, cand, self.cfg) is not None: return Event("pr_polled", now, {"prs": cand})
+            except Exception as e:  # noqa: BLE001 - a bad candidate never blocks adoption: the author listing below runs this pass
+                gone = bool(NOT_FOUND.search(str(e)))
+                log.warning("candidate PR #%s for %s %s: %s", n, rnd.thread, "not found, dropped" if gone else "view failed", e)
+                if gone: rnd.pr.pop("candidate", None)
         if not rnd.pr.get("number"):
             me = rnd.login("implementer", self.cfg)
-            if not me: return None  # whose PR is "own" is unknown: nothing to adopt
-            return Event("pr_polled", now, {"prs": github.list_prs(run, rnd.repo, me)})
+            if not me: return Event("pr_polled", now, {"prs": cand}) if cand else None  # whose PR is "own" is unknown: only the candidate
+            seen = {int(p.get("number") or 0) for p in cand}
+            return Event("pr_polled", now, {"prs": cand + [p for p in github.list_prs(run, rnd.repo, me) if int(p.get("number") or 0) not in seen]})
         pr = f"{rnd.repo}#{rnd.pr['number']}"
         return Event("pr_polled", now, {"view": github.view_pr(run, pr), "reviews": github.pr_reviews(run, pr)})
 
@@ -472,12 +587,13 @@ class Driver:
             return None
 
     def board_fields(self, a: Action):
-        """R47.2 board writes: Status, Stage, Role, dates and the assignee, field by field. Never `sync_study`, never `--body` (#49)."""
+        """R47.2 board writes: Status, Stage, Role, dates and the assignee, field by field; a wave job's `dates["eta_text"]` goes to the `ETA` text field (#110). Never `sync_study`, never `--body` (#49)."""
         if self.board is None or not self.cfg.board.enabled or not a.get("issue"): return
         api, n = self.board.api, int(a["issue"])
         writes = [*[(f, lambda f=f, o=o: api.set_option(n, f, o)) for f, o in (a.get("options") or {}).items()],
                   *[(f, lambda f=f, v=v: api.set_text(n, f, v)) for f, v in (a.get("texts") or {}).items()],
-                  *([("dates", lambda: api.set_dates(n, **a["dates"]))] if a.get("dates") else []),
+                  *([("dates", lambda: api.set_dates(n, **{k: v for k, v in a["dates"].items() if k != "eta_text"}))] if a.get("dates") else []),
+                  *([("eta_text", lambda: api.set_text(n, ETA_FIELD, a["dates"]["eta_text"]))] if (a.get("dates") or {}).get("eta_text") else []),
                   *[("assignee", lambda login=login: api.edit_issue(n, "--remove-assignee", login)) for login in a.get("remove_assignees") or []],
                   *([("assignee", lambda: api.edit_issue(n, "--add-assignee", a["assignee"]))] if a.get("assignee") else [])]
         for name, write in writes:  # one field at a time: a field the project lacks never suppresses the others, and the board never stalls a round
@@ -526,6 +642,7 @@ class Driver:
         self.fire_timers()
         self.poll_rounds()
         self.poll_waves()
+        self.tick_waves()
         self.poll_github()
         return n, int(page.get("scanned", 0)) < 1000
 
