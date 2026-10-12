@@ -808,7 +808,27 @@ enforces the rule, or the issue that will; "by hand" means the floor manager doe
   Innie for its current workload (reachable machines and slots, jobs in progress and queued,
   limits such as rate limits, offline windows and Outie sign-offs) before committing an ETA;
   an ETA without a fresh report is provisional. Snapshots go to a `workload` table. Enforced by:
-  by hand; #53, #54.
+  by hand; #53, #54, and #84 for the intake.
+  - *Report lines (floor manager ruling on #84, 2026-10-12):* the format `workload.py` parses is
+    canonical. A report carries the usage line
+
+        client | session: X% (resets HH:MM ET) | weekly: Y% (resets [Day] HH:MM ET)
+
+    and may carry a slots line, `slots: F/T` (free over total). For example:
+
+    `claude-code | session: 40% (resets 13:50 ET) | weekly: 22% (resets Mon 08:00 ET)`
+    `slots: 1/2`
+
+    A value the Innie cannot read is posted as `unreadable` (`claude | session: unreadable |
+    weekly: unreadable`) and stored as NULL, never estimated; a `(resets ...)` part may be left
+    out. A reset is a wall time in ET and is stored as its next occurrence after the post, in
+    UTC. Other lines of the post are free text. `workload.intake` reads a thread's posts through
+    the register (the Innie is the post's Slack sender; the source is `<thread>/<ts>`), and
+    a report line that does not parse, or a report from a sender the register does not list,
+    is a finding `{source, sender, reason}`, never a row. A report is fresh for 6 hours or until
+    a reset it carries passes. The ladder's alternatives also drop an Innie outside its
+    registered `hours`, read in ET; an Innie not in the register, or without `hours`, is kept.
+    The `workload: ...` example in the body of #84 is superseded.
 - **R51. Missed-ETA ladder, generic.** Status: in force. Acts on observed signals (deliverable,
   liveness, response), never a guessed cause; each step fires once per job with a `ref:` line;
   window W = clamp(25% of estimated hours, 15 min, 60 min): checkpoint at acceptance, check-in at

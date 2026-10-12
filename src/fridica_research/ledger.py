@@ -33,7 +33,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from . import eta
+from . import eta, workload
 
 # The prototype schema, verbatim (issue #53, comment 6113435186) plus the R50 amendment's usage
 # columns (#54) and the intake columns (#84) on `workload`. Do not reformat: the tests compare the live database against this text.
@@ -235,6 +235,24 @@ def ingest(db: sqlite3.Connection, report: dict, source: str) -> ImportResult:
     return import_rows(db, "workload", [row])
 
 
+def ingest_posts(db: sqlite3.Connection, posts, register, now: datetime, thread: str = "") -> tuple[ImportResult, list[dict]]:
+    """`workload.intake` then `ingest` for each row: a thread's posts into `workload` rows through the register.
+    Returns what the writes did and the intake's findings (dicts `{source, sender, reason}`)."""
+    rows, findings = workload.intake(posts, register, now, thread)
+    result = ImportResult()
+    for row in rows: result += ingest(db, {k: v for k, v in row.items() if k != "source"}, row["source"])
+    return result, findings
+
+
+def working(register, innie: str, now: datetime) -> bool:
+    """Whether `now` falls inside the Innie's registered working hours, read as ET (`workload.ET`, so EDT or EST
+    as the date has it). An Innie the register does not list, or one without `hours`, counts as working."""
+    entry = register.get(innie) if register is not None else None
+    if entry is None: return True
+    local = now.astimezone(workload.ET)
+    return entry.in_window("hours", local.hour * 60 + local.minute) is not False
+
+
 def fresh(row, now: datetime, hours: float = FRESH_HOURS) -> bool:
     """Whether a `workload` row still speaks for its Innie at `now`: posted no more than `hours`
     ago (and not in the future), and no usage reset it reports has passed since."""
@@ -251,17 +269,18 @@ def latest(db: sqlite3.Connection, now: datetime, hours: float = FRESH_HOURS) ->
     return {k: r for k, r in out.items() if fresh(r, now, hours)}
 
 
-def alternatives(db: sqlite3.Connection, now: datetime, hours: float = FRESH_HOURS, exclude=()) -> list[str]:
+def alternatives(db: sqlite3.Connection, now: datetime, hours: float = FRESH_HOURS, exclude=(), register=None) -> list[str]:
     """Innies with a fresh report and a free slot that are not capped, best first (R51's "first free alternative").
 
     Over quota (`session_usage >= eta.SESSION_QUOTA`) or capped (`weekly_usage >= eta.WEEKLY_CAP`)
     is out. Usage that is unknown (NULL, posted `unreadable`) is not capped, but such an Innie
     ranks after every Innie whose usage is known; so does one whose free slots are unknown.
     Ties go to more free slots, then lower weekly usage, then name. `exclude` drops Innies
-    (the one already holding the job's other role, for example)."""
+    (the one already holding the job's other role, for example). With a `register`, an Innie
+    outside its working hours at `now` (in ET) is out; see `working`."""
     ranked = []
     for name, r in latest(db, now, hours).items():
-        if name in exclude or r["free_slots"] == 0: continue
+        if name in exclude or r["free_slots"] == 0 or not working(register, name, now): continue
         s, w = r["session_usage"], r["weekly_usage"]
         if (s is not None and s >= eta.SESSION_QUOTA) or (w is not None and w >= eta.WEEKLY_CAP): continue
         ranked.append(((s is None or w is None, r["free_slots"] is None, -(r["free_slots"] or 0), w if w is not None else 0.0, name), name))

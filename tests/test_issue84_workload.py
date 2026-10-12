@@ -5,10 +5,12 @@ Every report here is synthetic. 2026-10-12 is a Monday in EDT (UTC-4); 2026-11-0
 import re
 import sqlite3
 from datetime import datetime, timezone
+from pathlib import Path
 
 import pytest
 
 from fridica_research import ledger, workload
+from fridica_research import register as reg
 from fridica_research.workload import WorkloadError, parse
 
 AT = datetime(2026, 10, 12, 15, 0, tzinfo=timezone.utc)  # 11:00 ET, Monday
@@ -128,3 +130,119 @@ def test_alternatives_skip_capped_and_full_and_rank_unknown_usage_last():
 
 def test_the_module_docstring_names_the_line_format():
     assert re.search(r"client \| session: X% \(resets HH:MM ET\) \| weekly: Y%", workload.__doc__)
+
+
+# -- thread posts into rows through the register (rest of #84) ----------------------------
+REGISTER = reg.parse('''
+[innie.alfa]
+outie = "Alfa Outie"
+slack = "U0ALFA"
+github = "alfa"
+hours = "09:00-17:00"
+
+[innie.bravo]
+outie = "Bravo Outie"
+slack = "U0BRAVO"
+github = "bravo"
+
+[innie.night]
+outie = "Night Outie"
+slack = "U0NIGHT"
+github = "night"
+hours = "22:00-06:00"
+''')
+TS = str(AT.timestamp())  # 11:00 ET
+NOW = datetime(2026, 10, 12, 16, 0, tzinfo=timezone.utc)  # 12:00 ET
+
+
+def _post(sender, text, ts=TS, **kw):
+    return {"sender": sender, "text": text, "ts": ts, **kw}
+
+
+def test_intake_reads_a_post_into_a_row_through_the_register():
+    rows, findings = workload.intake([_post("U0ALFA", "slots: 1/2\n" + LINE)], REGISTER, NOW, thread="C1/1791823244.1")
+    assert findings == []
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["innie"] == "alfa" and row["source"] == f"C1/1791823244.1/{TS}"
+    assert row["reported_at"] == "2026-10-12T15:00:00Z"  # the post's own ts, not `now`
+    assert (row["free_slots"], row["total_slots"], row["session_usage"], row["client"]) == (1, 2, 40.0, "claude-code")
+
+
+def test_a_posts_own_thread_overrides_the_argument():
+    rows, _ = workload.intake([_post("U0ALFA", LINE, thread="C9/1791000000.2"), _post("U0BRAVO", LINE)], REGISTER, NOW, thread="C1/1791823244.1")
+    assert [r["source"] for r in rows] == [f"C9/1791000000.2/{TS}", f"C1/1791823244.1/{TS}"]
+
+
+def test_findings_are_dicts_of_source_sender_and_reason():
+    posts = [
+        _post("U0ALFA", "claude | session: 140% | weekly: 22%"),  # malformed
+        _post("U0STRANGER", LINE),  # a report from someone the register does not list
+        _post("U0BRAVO", LINE, ts=str(NOW.timestamp() + 60)),  # dated after `now`
+        _post("U0BRAVO", LINE, ts="not-a-ts"),
+    ]
+    rows, findings = workload.intake(posts, REGISTER, NOW, thread="C1/1.1")
+    assert rows == []
+    assert all(set(f) == {"source", "sender", "reason"} for f in findings)
+    assert [(f["source"], f["sender"]) for f in findings] == [
+        (f"C1/1.1/{TS}", "U0ALFA"), (f"C1/1.1/{TS}", "U0STRANGER"), (f"C1/1.1/{NOW.timestamp() + 60}", "U0BRAVO"), ("C1/1.1/not-a-ts", "U0BRAVO")]
+    assert "140" in findings[0]["reason"] and "register" in findings[1]["reason"]
+    assert all(f["reason"] for f in findings)
+
+
+def test_plain_chat_is_neither_a_row_nor_a_finding():
+    rows, findings = workload.intake([_post("U0ALFA", "on it, PR soon"), _post("U0STRANGER", "thanks all")], REGISTER, NOW, thread="C1/1.1")
+    assert (rows, findings) == ([], [])
+
+
+def test_ingest_posts_writes_the_rows_and_is_idempotent():
+    db = ledger.connect()
+    posts = [_post("U0ALFA", "slots: 1/2\n" + LINE), _post("U0BRAVO", "slots: bad")]
+    result, findings = ledger.ingest_posts(db, posts, REGISTER, NOW, thread="C1/1.1")
+    assert result.inserted == 1 and [f["sender"] for f in findings] == ["U0BRAVO"]
+    before = ledger.dump(db, ("workload",))
+    again, _ = ledger.ingest_posts(db, posts, REGISTER, NOW, thread="C1/1.1")
+    assert again.unchanged == 1 and ledger.dump(db, ("workload",)) == before
+    assert db.execute("SELECT innie, source FROM workload").fetchone()[:] == ("alfa", f"C1/1.1/{TS}")
+
+
+# -- working hours, in ET ----------------------------------------------------------------
+def _free(*names, at=AT):
+    return _ledger(*((n, "slots: 1/1\nc | session: 10% | weekly: 10%", at) for n in names))
+
+
+def test_alternatives_drop_an_innie_outside_its_working_hours_in_et():
+    db = _free("alfa", "bravo", "night")
+    noon = datetime(2026, 10, 12, 16, 0, tzinfo=timezone.utc)  # 12:00 EDT: alfa in, night out
+    assert ledger.alternatives(db, noon, register=REGISTER) == ["alfa", "bravo"]
+    assert ledger.alternatives(db, noon) == ["alfa", "bravo", "night"]  # no register: no hours filter
+    evening = datetime(2026, 10, 12, 21, 30, tzinfo=timezone.utc)  # 17:30 EDT: alfa just out (17:30 UTC would be in)
+    db = _free("alfa", "bravo", "night", at=datetime(2026, 10, 12, 21, 0, tzinfo=timezone.utc))
+    assert ledger.alternatives(db, evening, register=REGISTER) == ["bravo"]
+
+
+def test_working_hours_follow_est_and_wrap_past_midnight():
+    nov = datetime(2026, 11, 2, 13, 30, tzinfo=timezone.utc)  # 08:30 EST (09:30 if it were read as EDT)
+    db = _free("alfa", "night", at=datetime(2026, 11, 2, 12, 0, tzinfo=timezone.utc))
+    assert ledger.alternatives(db, nov, register=REGISTER) == []  # alfa before 09:00, night after 06:00
+    late = datetime(2026, 11, 3, 4, 0, tzinfo=timezone.utc)  # 23:00 EST on the 2nd: night in, alfa out
+    db = _free("alfa", "night", at=datetime(2026, 11, 3, 3, 0, tzinfo=timezone.utc))
+    assert ledger.alternatives(db, late, register=REGISTER) == ["night"]
+
+
+def test_an_unregistered_innie_or_unset_hours_keeps_the_innie():
+    late = datetime(2026, 10, 13, 3, 0, tzinfo=timezone.utc)  # 23:00 EDT
+    db = _free("bravo", "ghost", "alfa", at=datetime(2026, 10, 13, 2, 0, tzinfo=timezone.utc))
+    assert ledger.alternatives(db, late, register=REGISTER) == ["bravo", "ghost"]
+    assert ledger.working(REGISTER, "ghost", late) and ledger.working(REGISTER, "bravo", late) and not ledger.working(REGISTER, "alfa", late)
+    assert ledger.working(None, "alfa", late)
+
+
+# -- the canonical line under R50 ----------------------------------------------------------
+def test_protocol_documents_the_canonical_report_lines_under_r50():
+    text = (Path(__file__).resolve().parents[1] / "docs" / "protocol.md").read_text()
+    r50 = text[text.index("**R50."):text.index("**R51.")]
+    assert "client | session: X% (resets HH:MM ET) | weekly: Y% (resets [Day] HH:MM ET)" in r50
+    assert "slots: F/T" in r50 and "unreadable" in r50 and "workload.py" in r50
+    sample = re.search(r"`([^`\n]+\| session:[^`\n]+)`\n", r50)
+    assert sample and parse(sample[1], AT).session_usage is not None  # the documented example parses
