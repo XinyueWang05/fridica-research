@@ -73,8 +73,8 @@ def job_thread(thread: str, n: int) -> str: return f"{thread}:job{n}"
 
 
 def parse_time(value, now: float | None = None) -> float | None:
-    """Epoch seconds, ISO 8601 (`2026-10-12T02:20:00Z`, naive is UTC), `MM-DD HH:MM ET` (the year of `now`), or a bare `HH:MM ET`,
-    its next occurrence after `now` (#83). None stays None. Times are stored as floats like `Round.due`."""
+    """Epoch seconds, ISO 8601 (`2026-10-12T02:20:00Z`, naive is UTC), or `MM-DD HH:MM ET` and a bare `HH:MM ET`, each its
+    next occurrence after `now` (#83): a passed date is next year's, a passed time tomorrow's. None stays None. Times are stored as floats like `Round.due`."""
     if value is None or value == "": return None
     if isinstance(value, (int, float)): return float(value)
     s = str(value).strip()
@@ -87,7 +87,11 @@ def parse_time(value, now: float | None = None) -> float | None:
         md = (int(m.group("mo")), int(m.group("d"))) if m.group("mo") else (base.month, base.day)
         try: t = base.replace(month=md[0], day=md[1], hour=int(m.group("h")), minute=int(m.group("mi")), second=0, microsecond=0)
         except ValueError as e: raise WaveError(f"{s!r}: {e}") from e
-        if not m.group("mo") and t.timestamp() <= float(now): t = datetime.combine(t.date() + timedelta(days=1), t.time(), ET)
+        if t.timestamp() <= float(now):  # already past: a bare time is tomorrow's, a dated one next year's
+            if not m.group("mo"): t = datetime.combine(t.date() + timedelta(days=1), t.time(), ET)
+            else:
+                try: t = datetime.combine(t.date().replace(year=t.year + 1), t.time(), ET)
+                except ValueError as e: raise WaveError(f"{s!r}: {e}") from e
         return t.timestamp()
     try: d = datetime.fromisoformat(s.replace("Z", "+00:00"))
     except ValueError as e: raise WaveError(f"{s!r} is not a time: epoch, ISO, `HH:MM ET` or `MM-DD HH:MM ET`") from e
@@ -182,8 +186,9 @@ class Wave:
 
 
 # -- opening (driver-only) --------------------------------------------------------------
-def parse_job(spec: str) -> dict:
-    """`issue=69;files=src/a.py,tests/;implementer=U1:login1;auditor=U2:login2;input_at=…;pr_eta=…;review_eta=…;config_change=no` -> a Job's fields."""
+def parse_job(spec: str, now: float | None = None) -> dict:
+    """`issue=69;files=src/a.py,tests/;implementer=U1:login1;auditor=U2:login2;input_at=…;pr_eta=…;review_eta=…;config_change=no` -> a Job's fields.
+    Without `now`, an ET time (`15:05 ET`, `10-13 09:00 ET`) stays text and `build_job` reads it against the opening's `now`."""
     out: dict = {}
     for part in str(spec).split(";"):
         if not part.strip(): continue
@@ -197,7 +202,7 @@ def parse_job(spec: str) -> dict:
             slack, _, login = value.partition(":")
             out[key] = {"slack": slack.strip(), "login": login.strip()}
         elif key == "config_change": out[key] = value.lower() in ("1", "true", "yes", "y")
-        elif key in ("input_at", *ETAS): out[key] = parse_time(value)
+        elif key in ("input_at", *ETAS): out[key] = value if now is None and ET_TIME.match(value) else parse_time(value, now)
         else: out[key] = value
     return out
 
@@ -238,8 +243,8 @@ def load_register(cfg: Config) -> register_mod.Register | None:
 def build_job(n: int, spec: dict, repo: str, now: float, cfg: Config, reg: register_mod.Register | None) -> Job:
     spec = {k: v for k, v in spec.items() if not (k == "repo" and not str(v or "").strip())}  # an empty `repo=` is unset: the wave's repo
     j = Job.from_dict({**{"repo": repo or ""}, **spec})
-    j.input_at = parse_time(j.input_at) if j.input_at is not None else now
-    j.pr_eta, j.review_eta = parse_time(j.pr_eta), parse_time(j.review_eta)
+    j.input_at = parse_time(j.input_at, now) if j.input_at is not None else now
+    j.pr_eta, j.review_eta = parse_time(j.pr_eta, now), parse_time(j.review_eta, now)
     check_job(n, j, cfg.owner)
     check_register(n, j, reg)
     j.files = [norm_path(f) for f in j.files]

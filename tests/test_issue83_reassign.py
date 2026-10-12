@@ -127,3 +127,26 @@ def test_ladder_ids_name_the_holder_and_the_eta():
     assert [a.id for a in ladder.step(later, T0 + 3 * H)] == [f"fm-wave-h-job2/UA@{int(T0 + 3 * H)}/checkin"]
     moved = dataclasses.replace(v, holder="UB", alternatives=[], checkin_at=None, done={c.id, r.id})  # a new holder: the same
     assert [a.id for a in ladder.step(moved, T0 + H)] == [f"fm-wave-h-job2/UB@{int(T0 + H)}/checkin"]
+
+
+# -- review fixes (Xi on f406241) -----------------------------------------------------------
+def test_month_day_before_now_rolls_to_next_year():
+    assert wave.parse_time("01-02 09:00 ET", now=datetime(2026, 12, 31, 22, 0, tzinfo=ET).timestamp()) == datetime(2027, 1, 2, 9, 0, tzinfo=ET).timestamp()
+    assert wave.parse_time("10-11 14:30 ET", now=T0) == datetime(2027, 10, 11, 14, 30, tzinfo=ET).timestamp()  # one day back
+    assert wave.parse_time("10-12 14:31 ET", now=T0) == et(10, 12, 14, 31)  # later today stays this year
+
+
+def test_bare_et_times_work_in_wave_open_and_add_job():
+    spec = "issue=83;files=src/wave.py;implementer=U0IMP1:imp1;auditor=U0AUD1:aud1;pr_eta=15:05 ET;review_eta=10-13 09:00 ET"
+    w = wave.open_wave(THREAD, name="h", repo=REPO, jobs=[wave.parse_job(spec)], now=T0, cfg=CFG)  # cli.py calls parse_job without now
+    assert w.jobs[0].pr_eta == et(10, 12, 15, 5) and w.jobs[0].review_eta == et(10, 13, 9, 0) and w.jobs[0].first_etas["pr_eta"] == et(10, 12, 15, 5)
+    assert wave.parse_job(spec, now=T0)["pr_eta"] == et(10, 12, 15, 5)
+    w = wave.add_job(w, wave.parse_job("issue=93;files=src/ladder.py;implementer=U0IMP2:imp2;auditor=U0AUD2:aud2;pr_eta=14:00 ET;review_eta=16:00 ET"), now=T0, cfg=CFG)
+    assert w.jobs[1].pr_eta == et(10, 13, 14, 0) and w.jobs[1].round["due"] == et(10, 13, 14, 0)
+
+
+def test_an_owner_post_with_fm_cmd_and_a_ref_applies_the_command_and_moves_no_round():
+    w0 = opened()
+    w, actions = wave.observe(w0, post("SIGN-OFF #108 f406241 approve\nfm-cmd: eta job1 pr 16:00 ET\nref: fm-wave-h-job1", "1.5"), CFG)
+    assert actions == [] and w.jobs[0].pr_eta == et(10, 12, 16, 0)
+    assert w.jobs[0].round["stage"] == w0.jobs[0].round["stage"] and not w.jobs[0].round.get("pr", {}).get("signoffs")  # owner posts never move a round (arbiter)

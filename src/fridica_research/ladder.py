@@ -42,7 +42,7 @@ POST_KIND = "report"
 @dataclass(frozen=True)
 class JobView:
     """What the ladder needs to know about one job. Times are epoch seconds; `est` is in seconds."""
-    ref: str  # the job's ref, e.g. `fm-wave-e-job2`; every action id is `<ref>/<rung>`
+    ref: str  # the job's ref, e.g. `fm-wave-e-job2`; a rung id is `<ref>/<holder>@<eta>/<rung>` (`key`), a question's `<ref>/question/<id>`
     holder: str
     owner: str
     est: float
