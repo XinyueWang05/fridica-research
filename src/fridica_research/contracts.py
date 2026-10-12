@@ -311,6 +311,17 @@ _MILESTONE = rf"(?:^Milestone:|\bmilestone) ({MILESTONE})(?![\w-]|\.[\w.-])"
 _HYGIENE = (("Closes #N", r"^Closes #\d+\s*$"), ("study thread", r"^(?:Study thread: \S+|Study:.*\bstudy thread \S+)"), ("board link", r"(?:^Board:|\bboard) https://github\.com/\S+"), ("milestone", _MILESTONE))
 
 
+_WAVE_REF = r"^(?:Closes|Refs) #\d+\b"
+
+
+def wave_pr_hygiene_missing(body: str, milestone: str | None = None) -> list[str]:
+    """A wave job's PR (fm-wave-h-rulings 1): a `Closes #N` or `Refs #N` line and a milestone, either the body's milestone line or
+    the PR's GitHub milestone. `milestone` is that field's title, "" when the PR has none, None when the read did not carry it (no gap)."""
+    out = [] if re.search(_WAVE_REF, body, re.M | re.I) else ["Closes #N or Refs #N"]
+    if milestone is not None and not str(milestone).strip() and not re.search(_MILESTONE, body, re.M | re.I): out.append("milestone")
+    return out
+
+
 def pr_milestone(body: str) -> str:
     """The generation milestone (`R<n>`, dotted parts kept) a hygienic PR body names."""
     return re.search(_MILESTONE, body, re.M | re.I).group(1).upper()
