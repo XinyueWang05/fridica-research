@@ -111,8 +111,8 @@ PRs. The first-pass implementer retains revisions and follow-ups for that PR.
     **reject** verdict as a `changes` sign-off with the reason; the sign-off format has no
     `reject` value.
 24. After three completed review rounds on the same PR and assigned scope, stop and report
-    to the floor manager with a summary before a fourth; it arbitrates or takes the question
-    to the owner (R48, R54). A revised head is a new round;
+    to the floor manager with a summary before a fourth. That is a judgment call, so it goes
+    to the deputy for arbitration (R54); owner-only questions go to the owner (R48). A revised head is a new round;
     repeated review on one head counts when substantive findings are delivered. Escalation
     never turns an unresolved blocker into approval.
 
@@ -126,8 +126,8 @@ PRs. The first-pass implementer retains revisions and follow-ups for that PR.
     submits that GitHub review. The driver merges only after the auditor approves the current
     head and required branch checks pass.
     If GitHub review permission is unavailable, report the technical gate as blocked to the
-    floor manager, who arbitrates or reassigns (R42, R48); a thread sign-off alone does not
-    clear it.
+    floor manager, who reassigns or applies R42; a judgment call it cannot settle by rule
+    goes to the deputy (R54). A thread sign-off alone does not clear it.
 26. Re-check the head immediately before signing. Any push resets your sign-off; do not sign a
     head you did not review.
 27. A review that lands after merge still counts. Route its findings to the first-pass author

@@ -20,8 +20,8 @@ auditor submits a GitHub review, bound to the current head. The driver merges on
 auditor approves the current head and required branch checks pass.
 
 The floor manager sets the review's ETA (R49); the auditor says so before missing it. On a
-miss the floor manager re-estimates or reschedules (R51), and judgment calls wake the deputy
-(R54). An unresolved blocker or unavailable approval leaves the PR unmerged;
+miss the floor manager re-estimates or reschedules (R51), and judgment calls go to the
+deputy (R54). An unresolved blocker or unavailable approval leaves the PR unmerged;
 neither timeout nor escalation waives the auditor's current-head approval.
 
 Debate covers at least two distinct lenses, followed by a summary of their agreement,
@@ -51,7 +51,7 @@ to a human. Source of truth for each rule is the code named beside it.
 | driver and arbitrator | assigned per study | Holds no PR role; runs threads, assignments and rotation, hand-offs, board, ETAs, replay gate and merge on auditor approval under maintainer authority; arbitrates disagreements and unclear rules; escalates owner-only questions to the study owner |
 
 The rows above are generated and left as they are. Since R48 the driver and arbitrator is the
-floor manager, who sets every ETA (R49); judgment calls and arbitration wake the deputy (R54);
+floor manager, who sets every ETA (R49); judgment calls and arbitration go to the deputy (R54);
 owner-only questions go to Cheng.
 
 ## The pipeline
@@ -631,8 +631,11 @@ enforces the rule, or the issue that will; "by hand" means the floor manager doe
   CHANGES_REQUESTED = changes, COMMENTED = finding without verdict); the Slack `SIGN-OFF` line is
   the fallback for reviewers without repository access, and each review is mirrored into the
   thread as one line. Who is requested is narrowed to the PR's auditor by R38. Enforced by:
-  `github.py`, `contracts.parse_signoff` (section R21 above) for studies only
-  (`driver.poll_github` walks the study store); for adopted rounds and wave jobs, by hand.
+  `github.py`, `contracts.parse_signoff` (section R21 above). Adopted rounds and wave jobs are
+  gated on the auditor's GitHub review of the current head too (`arbiter.observe`,
+  `arbiter.approved`, `driver.poll_waves`, `wave.py`); only the one-line mirror into the thread
+  is study-only (`driver.poll_github` walks the study store), and for rounds and waves it is by
+  hand.
 - **R22. Cross-repo work is part of the protocol.** Status: in force. A study may file issues
   and submit PRs on substrate and related repositories (fridica, fridica-core, pyharp, kintera,
   snapy, ...). Each cross-repo issue carries the study thread, the board link and the exact
@@ -680,10 +683,10 @@ enforces the rule, or the issue that will; "by hand" means the floor manager doe
 - **R27. Assignment invariant.** Status: in force. A card is `In Progress` only with exactly one
   assignee, set in the same transition; if the assignee cannot be set the card stays `Todo` with
   the login in `Workers` and one line asks the repository owner for access. Every transition
-  re-checks the invariant. Enforced by: `board.py` (R13, R14 above) for studies; by hand for
-  rounds and waves. `arbiter.board_action` moves the assignee, but the driver writes Status
-  before the assignee and only logs a failed write, there is no `Todo`/`Workers` fallback, and
-  wave jobs get no board write at open.
+  re-checks the invariant. Enforced by: by hand. `board.py` opens a study card with one
+  assignee and In Progress (R13, R14 above), but has no `Todo`/`Workers` fallback when the
+  assignee cannot be set; `arbiter.board_action` moves the assignee, but the driver writes Status
+  before the assignee and only logs a failed write; wave jobs get no board write at open.
 - **R28. ETA and check-back.** Status: superseded by R49. The assignee stated the ETA and the
   driver checked back at it; now the floor manager sets the ETA (R49) and runs the ladder (R51).
 - **R29. Mentions.** Status: in force. A post that needs a person to act @-mentions exactly
@@ -827,7 +830,8 @@ enforces the rule, or the issue that will; "by hand" means the floor manager doe
   wave closes with its R52 record. Supersedes R35 and, with R49, R37. Enforced by: by hand;
   #46 slice 4 (merge and open the next wave).
 - **R54. Judgment calls wake the deputy.** Status: in force (owner ruling 2026-10-12). The
-  deputy is Cheng's Innie. The driver wakes it through `fridica instruct` for arbitration and
-  judgment calls the rules do not settle; the deputy rules, and owner-only questions still go to
-  Cheng. The deputy does not take over when the floor manager is away. The board-naming rule
-  is R48. Enforced by: by hand; #80.
+  deputy is Cheng's Innie. It is woken for arbitration and judgment calls the rules do not
+  settle and rules on them; owner-only questions still go to Cheng. The deputy does not take
+  over when the floor manager is away. Who holds the floor manager role is governed by R48 and
+  stated in the wave's root message; the board has no field naming it (R51 is the ETA ladder,
+  not a naming rule). Enforced by: by hand; #80 (no driver code wakes the deputy yet).
