@@ -15,6 +15,7 @@ import pytest
 from fridica_research import cli, contracts, shadow, wave
 from fridica_research.store import Store
 from support import OWNER
+from test_driver import world  # noqa: F401 - the fake control socket fixture
 
 THREAD = "T1:C1:1791769427.483009"
 
@@ -156,3 +157,110 @@ def test_a_graphql_query_on_stdin_is_a_read_and_a_mutation_is_not():
     argv = ["gh", "api", "graphql", "--input", "-"]
     assert shadow.is_read(argv, json.dumps({"query": "query($o:String!){ user(login:$o){ id } }"}))
     assert not shadow.is_read(argv, json.dumps({"query": "mutation($p:ID!){ updateProjectV2ItemFieldValue(input:{}) { clientMutationId } }"}))
+
+
+# -- Xi's findings on 4ceade3 ----------------------------------------------------------------------------------------
+@pytest.mark.parametrize("argv", [
+    ["gh", "api", "--method=POST", "repos/o/r/issues"], ["gh", "api", "-XPOST", "repos/o/r/issues"], ["gh", "api", "-X", "POST", "repos/o/r/issues"],
+    ["gh", "api", "-Xpatch", "repos/o/r/issues/1"], ["gh", "api", "repos/o/r/issues", "-fbody=x"], ["gh", "api", "repos/o/r/issues", "-Fx=y"],
+    ["gh", "api", "repos/o/r/issues", "--raw-field=body=x"], ["gh", "api", "repos/o/r/issues", "--field", "x=y"], ["gh", "api", "repos/o/r/issues", "--input=body.json"],
+    ["gh", "api", "repos/o/r/issues", "--some-new-flag"], ["gh", "api", "repos/o/r/issues", "-Z"]])
+def test_unknown_or_glued_write_flags_fail_closed(argv): assert not shadow.is_read(argv)
+
+
+def test_known_read_flags_on_a_get_still_pass():
+    assert shadow.is_read(["gh", "api", "--paginate", "repos/o/r/pulls/1/reviews?per_page=100"])
+    assert shadow.is_read(["gh", "api", "-X", "GET", "repos/o/r"]) and shadow.is_read(["gh", "api", "--method=GET", "repos/o/r"])
+
+
+def test_shadow_posts_get_unique_numeric_slack_ts(tmp_path):
+    from fridica_research.machine import ts_key
+    c = shadow.ShadowClient(Real(), shadow.Sink(tmp_path / "s.jsonl", clock=lambda: 1_791_834_000.25), owner=OWNER)
+    for i in range(3): c.post_message(THREAD, contracts.PostRequest("report", f"p{i}\nref: fm-x/{i}"))
+    ts = [m["ts"] for m in c.thread(THREAD).messages if m["sender"] == OWNER]
+    assert len(set(ts)) == 3 and all(ts_key(t) for t in ts) and ts == sorted(ts, key=ts_key)
+    again = shadow.ShadowClient(Real(), shadow.Sink(tmp_path / "s.jsonl"), owner=OWNER)
+    assert [m["ts"] for m in again.thread(THREAD).messages if m["sender"] == OWNER] == ts  # stable across a restart
+
+
+def test_a_half_written_last_line_is_skipped_on_reopen(tmp_path):
+    path = tmp_path / "s.jsonl"
+    sink = shadow.Sink(path)
+    sink.record("gh", "k1", argv=["gh", "pr", "merge"])
+    with path.open("a") as f: f.write('{"kind": "gh", "key": "k2", "ar')  # the process died mid-write
+    again = shadow.Sink(path)
+    assert again.keys == {"k1"}
+    assert again.record("gh", "k2", argv=["x"]) and shadow.Sink(path).keys == {"k1", "k2"}
+
+
+def gated(tmp_path):
+    sink = shadow.Sink(tmp_path / "s.jsonl")
+    def real(argv, stdin):
+        assert shadow.is_read(argv, stdin), argv
+        if argv[:3] == ["gh", "api", "graphql"]:
+            return json.dumps({"data": {"repository": {"id": "R1", "issue": {"id": "I_1"}}}})
+        return "[]"
+    return sink, shadow.runner(real, sink)
+
+
+def test_board_writes_get_answers_their_callers_can_read(tmp_path):
+    from fridica_research import board, github
+    import dataclasses as dc
+    from support import CFG
+    cfg = dc.replace(CFG, board=dc.replace(CFG.board, enabled=True, owner="o", number=1, repo="o/r"))
+    sink, run = gated(tmp_path)
+    api = board.Projects(cfg, runner=run)
+    assert isinstance(api.graphql(board.M_SET_TEXT, project="P", item="I", field="F", v="x"), dict)  # no KeyError 'data'
+    assert api.graphql(board.M_ADD_ITEM, project="P", content="C")["addProjectV2ItemById"]["item"]["id"]
+    n = api.create_issue("t", "b")  # no IndexError
+    assert isinstance(n, int) and n > 0 and api.create_issue("t", "b") == n  # the same write, the same answer
+    gh = github.GitHub(cfg, runner=run)
+    assert isinstance(gh.milestone("o/r", "R9"), int)  # no KeyError 'number'
+    assert [r["kind"] for r in sink.rows] == ["gh"] * 4  # every distinct write logged once
+
+
+def test_a_board_sync_with_several_mutations_logs_all_of_them(tmp_path):
+    from fridica_research import board
+    import dataclasses as dc
+    from support import CFG
+    cfg = dc.replace(CFG, board=dc.replace(CFG.board, enabled=True, owner="o", number=1, repo="o/r"))
+    sink, run = gated(tmp_path)
+    api = board.Projects(cfg, runner=run)
+    api._project = board.ProjectIds("P", {f: {"id": f"F_{f}", "options": {"Implement": "O1", "In Progress": "O2"}} for f in ("Stage", "Status", "Started", "Projected finish", "ETA")})
+    api.item_for_issue = lambda repo, n: f"ITEM_{n}"
+    api.set_option(69, "Stage", "Implement")
+    api.set_option(69, "Status", "In Progress")
+    api.set_dates(69, started="2026-10-12", projected_finish="2026-10-13")
+    api.set_text(69, "ETA", "ETA 10-12 15:35 ET")
+    api.edit_issue(69, "--add-assignee", "imp1")
+    rows = [r for r in sink.rows if r["kind"] == "gh"]
+    assert len(rows) == 6 and sum(1 for r in rows if "mutation" in (r.get("stdin") or "")) == 5
+
+
+def test_restart_through_a_claim_finds_the_shadow_post_and_its_ts_sorts(world, tmp_path):  # noqa: F811 - the imported fixture
+    from fridica_research.machine import ts_key
+    from test_driver import EXPLORER_REPORT, drain, make_driver, result, root_text
+    server, cfg = world
+    thread = "T1:C1:1700000000.000100"
+    server.root(thread, OWNER, root_text())
+    drv = make_driver(cfg)
+    drain(drv)
+    server.finish_job(thread, server.job_of(thread, "explorer")["id"], result(report=EXPLORER_REPORT))
+    drain(drv)
+    s = drv.store.load(thread)
+    claim = server.view(thread)["messages"][-1]["text"]
+    ref = s.waiting["id"].rsplit("/", 1)[0] + "/claim-shadow"
+    s.claim.update(status="pending", ts=None)
+    s.phase, s.waiting = "post", {"kind": "post", "id": ref, "action": {"thread": thread, "post_kind": "study_claim", "text": claim.rsplit("\nref: ", 1)[0] + f"\nref: {ref}", "details": None}}
+    drv.store.save(s)
+    path = tmp_path / "shadow.jsonl"
+    claims_before = sum(1 for m in server.view(thread)["messages"] if m["meta"] and m["meta"]["kind"] == "study_claim")
+    for _ in range(2):  # the first run sends the claim to the sink; the restart finds it there through own_post_with_ref
+        d = make_driver(cfg, store=Store(cfg.state_file))
+        d.client = shadow.ShadowClient(d.client, shadow.Sink(path), owner=OWNER)
+        drain(d)
+    s2 = d.store.load(thread)
+    rows = [json.loads(line) for line in path.read_text().splitlines()]
+    assert [r["ref"] for r in rows if r["kind"] == "post_message"] == [ref]
+    assert s2.claim["status"] == "settling" and s2.claim["ts"] == rows[0]["ts"] and ts_key(s2.claim["ts"])
+    assert sum(1 for m in server.view(thread)["messages"] if m["meta"] and m["meta"]["kind"] == "study_claim") == claims_before

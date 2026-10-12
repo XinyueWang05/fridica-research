@@ -13,6 +13,7 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
+import re
 import time
 from pathlib import Path
 
@@ -20,20 +21,40 @@ from . import contracts
 
 GH_READS = {"pr": {"view", "list", "checks", "diff", "status"}, "issue": {"view", "list"}, "project": {"view", "list", "field-list", "item-list"}}
 API_BODY_FLAGS = {"-f", "-F", "--field", "--raw-field", "--input"}
+API_READ_FLAGS = {"--paginate", "--slurp", "--include", "-i", "--silent", "--verbose", "--jq", "-q", "--template", "-t", "--cache", "--header", "-H", "--hostname"}
+API_VALUE_FLAGS = {"-X", "--method", "--jq", "-q", "--template", "-t", "--cache", "--header", "-H", "--hostname", *API_BODY_FLAGS}
+
+
+def api_flags(args: list[str]) -> list[tuple[str, str | None]]:
+    """`gh api` flags as (name, value): `--name=v`, `-Xv` glued, or the value in the next token."""
+    out, i = [], 0
+    while i < len(args):
+        a = args[i]
+        if a.startswith("--"):
+            name, eq, val = a.partition("=")
+            if not eq and name in API_VALUE_FLAGS and i + 1 < len(args): val, i = args[i + 1], i + 1
+            out.append((name, val if (eq or name in API_VALUE_FLAGS) else None))
+        elif a.startswith("-") and len(a) > 1:
+            name, val = a[:2], a[2:] or None
+            if val is None and name in API_VALUE_FLAGS and i + 1 < len(args): val, i = args[i + 1], i + 1
+            out.append((name, val))
+        i += 1
+    return out
 
 
 def is_read(argv: list[str], stdin: str | None = None) -> bool:
-    """True only for the listed gh reads; anything else (and anything that is not gh) is a write. A graphql call is
-    judged by its query, in argv (`-f query=...`) or on stdin (`--input -`, as `board.Projects.graphql` sends it)."""
+    """True only for the listed gh reads; anything else (and anything that is not gh) is a write. It fails closed: a
+    `gh api` call is a read only as a GET (`-X`/`--method`, glued or not) whose every flag is a known read flag. A graphql
+    call is judged by its query, in argv (`-f query=...`) or on stdin (`--input -`, as `board.Projects.graphql` sends it)."""
     a = [str(x) for x in argv or []]
     if len(a) < 3 or a[0] != "gh": return False
     if a[1] in GH_READS: return a[2] in GH_READS[a[1]]
     if a[1] != "api": return False
-    method = next((a[i + 1].upper() for i, x in enumerate(a[:-1]) if x in ("-X", "--method")), "GET")
-    if method != "GET": return False
+    flags = api_flags(a[2:])
+    if any((v or "").upper() != "GET" for n, v in flags if n in ("-X", "--method")): return False
     if "graphql" in a[2:]:
         return not any("mutation" in x.lower() for x in [*a, stdin or ""])  # allowed unless it mutates
-    return not any(x in API_BODY_FLAGS or any(x.startswith(f + "=") for f in API_BODY_FLAGS if f.startswith("--")) for x in a)
+    return all(n in API_READ_FLAGS or n in ("-X", "--method") for n, _ in flags)
 
 
 def digest(*parts) -> str: return hashlib.sha256(json.dumps(parts, sort_keys=True, default=str).encode()).hexdigest()
@@ -47,15 +68,20 @@ class Sink:
         self.rows: list[dict] = []
         if self.path.exists():
             for line in self.path.read_text().splitlines():
-                if line.strip(): self.rows.append(json.loads(line))
+                try: row = json.loads(line) if line.strip() else None
+                except json.JSONDecodeError: row = None  # a line half-written when the process died: skipped, its write is redone
+                if isinstance(row, dict) and "key" in row: self.rows.append(row)
         self.keys = {r["key"] for r in self.rows}
 
     def record(self, kind: str, key: str, **fields) -> bool:
         """Append the action unless its key is already in the sink; True when it was new."""
         if key in self.keys: return False
-        row = {"at": self.clock(), "kind": kind, "key": key, **fields}
+        at = self.clock()
+        row = {"at": at, "ts": f"{int(at)}.{len(self.rows) + 1:06d}", "kind": kind, "key": key, **fields}  # a Slack-style ts, unique per row
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self.path.open("a") as f: f.write(json.dumps(row, sort_keys=True) + "\n")
+        with self.path.open("a") as f:
+            if f.tell() and not self.path.read_bytes().endswith(b"\n"): f.write("\n")  # end a torn line before appending
+            f.write(json.dumps(row, sort_keys=True) + "\n")
         self.rows.append(row)
         self.keys.add(key)
         return True
@@ -67,9 +93,29 @@ def runner(real, sink: Sink):
     """A gh runner: reads go to `real`, every other call to the sink (keyed by a hash of argv and stdin) and returns `{}`."""
     def run(argv, stdin):
         if is_read(argv, stdin): return real(argv, stdin)
-        sink.record("gh", "gh:" + digest(list(argv), stdin), argv=list(argv), stdin=stdin)
-        return "{}"
+        key = "gh:" + digest(list(argv), stdin)
+        sink.record("gh", key, argv=list(argv), stdin=stdin)
+        return answer(list(argv), stdin, key)
     return run
+
+
+def answer(argv: list[str], stdin: str | None, key: str) -> str:
+    """A synthetic answer shaped for the caller of a blocked write, the same for the same write: a graphql mutation gets
+    `data` with its field (`addProjectV2ItemById` an item id), `issue/pr create` a URL, `issue comment` a comment URL,
+    a REST write a JSON object with `number` and `id` (a created milestone), anything else an empty string."""
+    num = 900_000 + int(key[-8:], 16) % 100_000
+    repo = argv[argv.index("-R") + 1] if "-R" in argv and argv.index("-R") + 1 < len(argv) else "shadow/shadow"
+    if argv[:3] == ["gh", "api", "graphql"]:
+        m = re.search(r"mutation[^{]*\{\s*(\w+)", stdin or " ".join(argv))
+        name = m.group(1) if m else "mutation"
+        return json.dumps({"data": {name: {"item": {"id": f"SHADOW_ITEM_{key[3:15]}"}} if name == "addProjectV2ItemById" else {}}})
+    if argv[1:3] in (["issue", "create"], ["pr", "create"]): return f"https://github.com/{repo}/{'issues' if argv[1] == 'issue' else 'pull'}/{num}\n"
+    if argv[1:3] == ["issue", "comment"]: return f"https://github.com/{repo}/issues/{argv[3]}#issuecomment-{num}\n"
+    if argv[1:2] == ["api"]:
+        try: title = (json.loads(stdin) or {}).get("title") if stdin else None
+        except (ValueError, AttributeError): title = None
+        return json.dumps({"number": num, "id": num, **({"title": title} if title else {})})
+    return ""
 
 
 class ShadowClient:
@@ -85,7 +131,7 @@ class ShadowClient:
 
     def thread(self, thread: str) -> contracts.ThreadView:
         view = self.real.thread(thread)
-        shadow_posts = [{"ts": f"shadow.{i:06d}", "sender": self.owner, "text": r.get("text", "")} for i, r in enumerate(self.sink.posts(thread), 1)]
+        shadow_posts = [{"ts": r.get("ts") or f"{int(r.get('at') or 0)}.{i:06d}", "sender": self.owner, "text": r.get("text", "")} for i, r in enumerate(self.sink.posts(thread), 1)]
         return dataclasses.replace(view, messages=list(view.messages) + shadow_posts)
 
     def _sink(self, kind: str, thread: str, text: str = "", ref: str | None = None, **fields) -> dict:
