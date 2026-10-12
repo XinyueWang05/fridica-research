@@ -23,6 +23,7 @@ from .store import Store
 
 log = logging.getLogger("fridica_research.driver")
 LlmRunner = Callable[[str, str], dict]  # (schema name, prompt) -> payload
+ETA_FIELD = "ETA"  # the board text field a wave job's `dates["eta_text"]` goes to (#110); `Board.set_dates` takes dates only
 GH_FAILING_PASSES = 3  # consecutive wave polling passes with a failed GitHub read before the owner is told (#85)
 
 
@@ -548,8 +549,9 @@ class Driver:
     def read_pr(self, rnd: arbiter.Round, run) -> Event | None:
         now = self.clock()
         if not rnd.pr.get("number") and rnd.pr.get("candidate"):  # job 4's candidate may be another author's PR: `list_prs --author` would miss it
-            view = github.view_pr(run, f"{rnd.repo}#{rnd.pr['candidate']}")
-            view.setdefault("number", int(rnd.pr["candidate"]))
+            n = int(rnd.pr["candidate"])  # the adoption fields (`LIST_FIELDS`: number, author, body, ...): `view_pr` reads no body
+            view = json.loads(run(["gh", "pr", "view", str(n), "-R", rnd.repo, "--json", github.LIST_FIELDS], None) or "{}")
+            view.setdefault("number", n)
             return Event("pr_polled", now, {"prs": [view]})
         if not rnd.pr.get("number"):
             me = rnd.login("implementer", self.cfg)
@@ -567,12 +569,13 @@ class Driver:
             return None
 
     def board_fields(self, a: Action):
-        """R47.2 board writes: Status, Stage, Role, dates and the assignee, field by field. Never `sync_study`, never `--body` (#49)."""
+        """R47.2 board writes: Status, Stage, Role, dates and the assignee, field by field; a wave job's `dates["eta_text"]` goes to the `ETA` text field (#110). Never `sync_study`, never `--body` (#49)."""
         if self.board is None or not self.cfg.board.enabled or not a.get("issue"): return
         api, n = self.board.api, int(a["issue"])
         writes = [*[(f, lambda f=f, o=o: api.set_option(n, f, o)) for f, o in (a.get("options") or {}).items()],
                   *[(f, lambda f=f, v=v: api.set_text(n, f, v)) for f, v in (a.get("texts") or {}).items()],
-                  *([("dates", lambda: api.set_dates(n, **a["dates"]))] if a.get("dates") else []),
+                  *([("dates", lambda: api.set_dates(n, **{k: v for k, v in a["dates"].items() if k != "eta_text"}))] if a.get("dates") else []),
+                  *([("eta_text", lambda: api.set_text(n, ETA_FIELD, a["dates"]["eta_text"]))] if (a.get("dates") or {}).get("eta_text") else []),
                   *[("assignee", lambda login=login: api.edit_issue(n, "--remove-assignee", login)) for login in a.get("remove_assignees") or []],
                   *([("assignee", lambda: api.edit_issue(n, "--add-assignee", a["assignee"]))] if a.get("assignee") else [])]
         for name, write in writes:  # one field at a time: a field the project lacks never suppresses the others, and the board never stalls a round

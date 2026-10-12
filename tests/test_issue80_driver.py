@@ -7,10 +7,18 @@ With `r.pr["candidate"]` set and no PR recorded, the driver views that PR and fe
 """
 from __future__ import annotations
 
-from fridica_research import deputy, wave
+import dataclasses
+import json
+from types import SimpleNamespace
+
+from fridica_research import arbiter, deputy, wave
+from fridica_research.driver import Driver
+from fridica_research.machine import Action
+from support import CFG
 from test_issue69_wave import H, HEAD, PEOPLE, T0, THREAD
-from test_issue69b_driver import approve, stored
+from test_issue69b_driver import approve, make, stored
 from test_issue83_driver import ladder_world, refs
+from test_issue88_driver import ReviewGh
 
 MIN = 60.0
 
@@ -101,3 +109,81 @@ def test_a_recorded_pr_wins_over_the_candidate(tmp_path):
     clock.t += H
     drv.run_once()
     assert not any(a[:4] == ["gh", "pr", "view", "99"] for a in gh.calls)
+
+
+# -- job 1 / job 4 integration (#110): the candidate view carries the adoption fields, eta_text is a text field --------
+class CandidateGh(ReviewGh):
+    """ReviewGh whose `gh pr view` answers only the `--json` fields asked for, as gh does."""
+
+    def run(self, argv, stdin):
+        if argv[:3] == ["gh", "pr", "view"] and "--json" in argv:
+            n = int(argv[3])
+            p = self.prs[n]
+            full = {"number": n, "headRefOid": p["head"], "state": p["state"], "isDraft": False, "author": {"login": p["author"]}, "body": f"Refs #{p['issue']}",
+                    "mergedAt": None, "mergeCommit": None, "milestone": None, "mergeable": "MERGEABLE", "statusCheckRollup": []}
+            self.calls.append(argv)
+            return json.dumps({k: full[k] for k in argv[argv.index("--json") + 1].split(",") if k in full})
+        return super().run(argv, stdin)
+
+
+def candidate_world(tmp_path, author: str):
+    store, client, _, clock, _ = ladder_world(tmp_path)
+    gh = CandidateGh()
+    gh.prs = {71: {"author": "imp1", "issue": 69, "state": "OPEN", "head": HEAD}, 72: {"author": "imp2", "issue": 54, "state": "OPEN", "head": HEAD},
+              80: {"author": author, "issue": 61, "state": "OPEN", "head": HEAD}}
+    w = stored(store)
+    w.jobs[2].round.setdefault("pr", {})["candidate"] = 80
+    store.set_meta(wave.wave_key(THREAD), w.to_json())
+    return store, client, gh, clock, make(store, client, gh, clock)
+
+
+def test_the_candidate_view_carries_number_author_and_body(tmp_path):
+    store, client, gh, clock, drv = candidate_world(tmp_path, "someone-else")
+    ev = drv.read_pr(stored(store).jobs[2].rnd(), gh.run)
+    (view,) = ev.get("prs")
+    assert view["number"] == 80 and view["author"] == {"login": "someone-else"} and view["body"] == "Refs #61" and view["headRefOid"] == HEAD
+
+
+def test_the_implementers_own_candidate_is_adopted(tmp_path):
+    store, client, gh, clock, drv = candidate_world(tmp_path, "imp3")
+    drv.run_once()
+    assert stored(store).jobs[2].rnd().pr.get("number") == 80
+
+
+class DatesApi:
+    """The board api with `Board.set_dates`'s own signature: an unknown keyword raises TypeError, as the real one does."""
+
+    def __init__(self): self.writes: list[tuple] = []
+    def set_dates(self, issue, started=None, projected_finish=None, finished=None): self.writes.append(("dates", issue, started, projected_finish, finished))
+    def set_text(self, issue, field, value): self.writes.append(("text", issue, field, value))
+    def set_option(self, issue, field, option): self.writes.append(("option", issue, field, option))
+    def edit_issue(self, issue, *args): self.writes.append(("edit", issue, *args))
+
+
+def board_driver(tmp_path):
+    store, client, gh, clock, _ = ladder_world(tmp_path)
+    api = DatesApi()
+    cfg = dataclasses.replace(CFG, board=dataclasses.replace(CFG.board, enabled=True))
+    drv = Driver(cfg, client, store, llm=lambda *a: {}, clock=clock, sleep=lambda s: None, github=SimpleNamespace(run=gh.run, poll=lambda *a: None), board=SimpleNamespace(api=api))
+    return api, drv
+
+
+def wave_board_action(eta_text: bool = True) -> Action:
+    """A board write as #110's `board_action` builds it for a wave job: `eta_text` = `eta_line(due)` inside `dates`."""
+    dates = {"started": "2026-10-12", "projected_finish": "2026-10-12", **({"eta_text": arbiter.eta_line(T0 + 2 * H)} if eta_text else {})}
+    return Action("board_update", f"{THREAD}/round/Implement-CodeAudit/board/1", {"thread": THREAD, "issue": 69, "repo": "chengcli/fridica-research", "options": {}, "dates": dates})
+
+
+def test_eta_text_is_written_as_a_text_field_and_the_dates_still_go_in(tmp_path, caplog):
+    api, drv = board_driver(tmp_path)
+    a = wave_board_action()
+    drv.board_fields(a)
+    assert ("dates", 69, "2026-10-12", "2026-10-12", None) in api.writes
+    assert ("text", 69, "ETA", arbiter.eta_line(T0 + 2 * H)) in api.writes
+    assert "eta_text" in a["dates"] and "failed" not in caplog.text  # the action itself is not changed: a retry writes the same fields
+
+
+def test_dates_without_eta_text_write_no_eta_field(tmp_path):
+    api, drv = board_driver(tmp_path)
+    drv.board_fields(wave_board_action(eta_text=False))
+    assert [w for w in api.writes if w[0] == "text"] == [] and ("dates", 69, "2026-10-12", "2026-10-12", None) in api.writes
