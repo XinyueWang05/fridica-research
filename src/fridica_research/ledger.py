@@ -4,8 +4,11 @@ One SQLite file holding one row per job, who did it, what the ETA rested on and 
 so the floor manager's ETAs can be scored (R48) and a wave can be closed with a record (R52).
 
 `DDL` below is the prototype schema, copied verbatim from Cheng's comment on issue #53
-(comment id 6113435186, 2026-10-11T20:31:57Z); `tests/test_issue53_ledger.py` checks the
-database this module creates against that text column by column. The real prototype
+(comment id 6113435186, 2026-10-11T20:31:57Z), plus the four usage columns of the R50 amendment
+(#54: `session_usage`, `session_reset`, `weekly_usage`, `weekly_reset` on `workload`, after
+`offline`); `tests/test_issue53_ledger.py` checks the database this module creates against that
+text column by column. A ledger file written before the amendment is brought up to date on
+`connect` (`ALTER TABLE ... ADD COLUMN`), and a prototype without the columns still imports. The real prototype
 (`~/.local/state/fridica-research/jobs.sqlite3`) stays with the floor manager: nothing here
 reads a fixed path, and the tests run on a synthetic fixture built from the DDL.
 
@@ -29,8 +32,8 @@ from pathlib import Path
 
 from . import eta
 
-# The prototype schema, verbatim (issue #53, comment 6113435186). Do not reformat: the tests
-# compare the live database against this text.
+# The prototype schema, verbatim (issue #53, comment 6113435186) plus the R50 amendment's usage
+# columns on `workload` (#54). Do not reformat: the tests compare the live database against this text.
 DDL = """
 CREATE TABLE innies(
   innie TEXT PRIMARY KEY, outie TEXT, slack TEXT, github TEXT,
@@ -54,13 +57,20 @@ CREATE TABLE waves(
 CREATE TABLE workload(
   id INTEGER PRIMARY KEY, innie TEXT, asked_at TEXT, reported_at TEXT,
   machines TEXT, slots INTEGER, in_progress TEXT, queued TEXT, limits TEXT,
-  offline TEXT, source TEXT, recorded TEXT DEFAULT (datetime('now')));
+  offline TEXT, session_usage REAL, session_reset TEXT, weekly_usage REAL, weekly_reset TEXT,
+  source TEXT, recorded TEXT DEFAULT (datetime('now')));
 """
 
 TABLES = ("innies", "jobs", "lessons", "waves", "workload")
 KEYS = {"innies": "innie", "jobs": "id", "lessons": "id", "waves": "wave", "workload": "id"}
 DEFAULTED = ("recorded",)  # columns whose default is a clock: set once, never rewritten by an import
 SCHEMA = DDL.replace("CREATE TABLE ", "CREATE TABLE IF NOT EXISTS ")  # same tables; re-opening a ledger is not an error
+USAGE_COLUMNS = (("session_usage", "REAL"), ("session_reset", "TEXT"), ("weekly_usage", "REAL"), ("weekly_reset", "TEXT"))  # R50 amendment (#54), on `workload`
+
+
+def ro_uri(path: str | Path) -> str:
+    """The read-only SQLite URI of a file: `Path.resolve().as_uri()` percent-encodes `#`, `?`, `%` and spaces, which a bare `file:<path>` would not."""
+    return Path(path).resolve().as_uri() + "?mode=ro"
 
 
 def connect(path: str | Path = ":memory:") -> sqlite3.Connection:
@@ -69,13 +79,16 @@ def connect(path: str | Path = ":memory:") -> sqlite3.Connection:
     db = sqlite3.connect(str(path), isolation_level=None)
     db.row_factory = sqlite3.Row
     db.executescript(SCHEMA)
+    have = columns(db, "workload")
+    for name, kind in USAGE_COLUMNS:  # a ledger created before the R50 amendment gains the usage columns in place
+        if name not in have: db.execute(f"ALTER TABLE workload ADD COLUMN {name} {kind}")
     return db
 
 
 def open_existing(path: str | Path) -> sqlite3.Connection:
     """Open a ledger that must already exist, read-only: a missing path is an error, never an empty new ledger."""
     if not Path(path).is_file(): raise FileNotFoundError(f"no ledger at {path}")
-    db = sqlite3.connect(f"file:{Path(path)}?mode=ro", uri=True)
+    db = sqlite3.connect(ro_uri(path), uri=True)
     db.row_factory = sqlite3.Row
     return db
 
@@ -136,9 +149,10 @@ def import_sqlite(db: sqlite3.Connection, source: str | Path, tables=TABLES) -> 
 
     This is how the floor manager's local `jobs.sqlite3` is read (#53). The path is the caller's;
     a table the source lacks is passed over rather than being an error, so an older prototype
-    (no `waves`, no `workload`) imports cleanly.
+    (no `waves`, no `workload`) imports cleanly, and so does one whose `workload` predates the
+    usage columns: a row carries only the columns its source has.
     """
-    src = sqlite3.connect(f"file:{Path(source)}?mode=ro", uri=True)
+    src = sqlite3.connect(ro_uri(source), uri=True)
     src.row_factory = sqlite3.Row
     try:
         present = {r[0] for r in src.execute("SELECT name FROM sqlite_master WHERE type='table'")}

@@ -60,6 +60,7 @@
    "explore": 1200,
    "implement": 5400
   },
+  "register": "",
   "repos": [],
   "require_signoffs": true,
   "reviewers": [

@@ -36,6 +36,8 @@ from datetime import datetime, timedelta
 from statistics import fmean
 
 HOUR = timedelta(hours=1)
+SESSION_QUOTA = 90.0  # R50 amendment (#54): a session this far used cannot carry a job; the input time moves to the reset (cause "quota")
+WEEKLY_CAP = 80.0  # R50 amendment (#54): weekly usage this high means short jobs only, nothing on the critical path (`capped`)
 EVIDENCE_RANK = ("workload", "trial", "history", "reasoning")  # best evidence first (lesson 1)
 WORK_BASES = ("trial", "history", "reasoning")  # the ledger's `jobs.est_basis` vocabulary
 
@@ -64,6 +66,20 @@ class WorkloadReport:
     rate_limited_hours: float = 0.0  # a limit the Innie says is biting now
     offline_until: datetime | None = None
     source: str = ""
+    session_usage: float | None = None  # % of the session limit used, from the client's usage view (R50 amendment)
+    session_reset: datetime | None = None
+    weekly_usage: float | None = None  # % of the weekly limit used
+    weekly_reset: datetime | None = None
+
+    @property
+    def quota_exhausted(self) -> bool:
+        """The session is at or past `SESSION_QUOTA`: the Innie stalls until `session_reset`."""
+        return self.session_usage is not None and self.session_usage >= SESSION_QUOTA
+
+    @property
+    def capped(self) -> bool:
+        """Weekly usage at or past `WEEKLY_CAP`: short jobs only, and nothing on the critical path."""
+        return self.weekly_usage is not None and self.weekly_usage >= WEEKLY_CAP
 
     @property
     def free(self) -> bool:
@@ -124,6 +140,8 @@ class Estimate:
     work_basis: str  # what the work rests on: trial | history | reasoning (jobs.est_basis)
     buffer: dict[str, float] = field(default_factory=dict)
     rationale: str = ""
+    cause: str = ""  # "quota" when the input time was moved to the session reset (R50 amendment, the R51 ladder's cause tag)
+    capped: bool = False  # weekly usage at or past WEEKLY_CAP: short jobs only, no critical-path job
 
     @property
     def est_hours(self) -> float:
@@ -175,6 +193,12 @@ def estimate(now: datetime, innie: str, *, buffer: InnieBuffer | None = None, wo
 
     # input time: an Innie that reports itself free starts now, not when its queue would have drained.
     start = now if (report is not None and report.free) else (input_at or now)
+    # quota (R50 amendment): a session used past SESSION_QUOTA with a known reset moves the input time to that reset.
+    # A stale report settles nothing here either: both the quota and the cap come from a fresh report only.
+    cause = ""
+    if report is not None and report.quota_exhausted and report.session_reset is not None and report.session_reset > start:
+        start, cause = report.session_reset, "quota"
+    capped = report is not None and report.capped
 
     # buffer: each piece only when this job actually pays for it.
     parts = {
@@ -187,8 +211,10 @@ def estimate(now: datetime, innie: str, *, buffer: InnieBuffer | None = None, wo
     total = sum(parts.values())
     basis = "workload" if report is not None else work_basis
     why = f"{work:.2f} h work from {work_basis}" + (f" + {total:.2f} h buffer (" + ", ".join(f"{k} {v:.2f}" for k, v in parts.items()) + ")" if parts else " + no buffer")
+    if cause: why += f"; input moved to the session reset {start.isoformat()} (quota, session at {report.session_usage:.0f}%)"
+    if capped: why += f"; weekly at {report.weekly_usage:.0f}%: short jobs only, not on the critical path"
     return Estimate(eta=start + (work + total) * HOUR, input_at=start, work_hours=work, buffer_hours=total,
-                    basis=basis, work_basis=work_basis, buffer=parts, rationale=why)
+                    basis=basis, work_basis=work_basis, buffer=parts, rationale=why, cause=cause, capped=capped)
 
 
 # -- the score ------------------------------------------------------------------
