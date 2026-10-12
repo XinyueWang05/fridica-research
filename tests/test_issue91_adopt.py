@@ -31,8 +31,8 @@ def poll(r, **data):
     return arbiter.observe(r, Event("pr_polled", T0, data), config.Config())
 
 
-def pr(n=95, login="imp", body=GOOD, state="OPEN", head=HEAD) -> dict:
-    return {"number": n, "headRefOid": head, "state": state, "isDraft": False, "author": {"login": login}, "body": body}
+def pr(n=95, login="imp", body=GOOD, state="OPEN", head=HEAD, **more) -> dict:
+    return {"number": n, "headRefOid": head, "state": state, "isDraft": False, "author": {"login": login}, "body": body, **more}
 
 
 def texts(actions) -> list[str]: return [a.data["text"] for a in actions if a.kind == "post"]
@@ -86,10 +86,10 @@ def test_an_adopted_round_keeps_the_reason_as_a_finding_only():
 
 # -- (2) R23 hygiene on a recorded PR -------------------------------------------------------
 def test_a_recorded_pr_missing_hygiene_lines_gets_one_post():
-    r, a1 = poll(rnd(), prs=[pr(body="Refs #91")])
-    r, a2 = poll(r, view={"headRefOid": HEAD, "state": "OPEN", "body": "Refs #91"})
+    r, a1 = poll(rnd(), prs=[pr(body="Refs #91", milestone=None)])
+    r, a2 = poll(r, view={"headRefOid": HEAD, "state": "OPEN", "body": "Refs #91", "milestone": None})
     assert r.pr["number"] == 95 and len(texts(a1)) == 1 and texts(a2) == []
-    assert "milestone" in texts(a1)[0] and "board link" in texts(a1)[0]
+    assert "milestone" in texts(a1)[0] and "board link" not in texts(a1)[0]  # a wave job: no study or board line (fm-wave-h-rulings 1)
 
 
 def test_a_hygienic_pr_gets_no_post():
@@ -103,24 +103,47 @@ def test_a_missing_body_field_is_no_gap():
 
 
 def test_fixing_one_of_two_gaps_posts_the_remaining_gap_once():
-    two = "Closes #91\nStudy thread: 1700000000.000100"  # lacks the board link and the milestone
-    r, a1 = poll(rnd(), prs=[pr(body=two)])
-    r, a2 = poll(r, view={"headRefOid": HEAD, "state": "OPEN", "body": two + "\nMilestone: R2"})
-    r, a3 = poll(r, view={"headRefOid": HEAD, "state": "OPEN", "body": two + "\nMilestone: R2"})
-    assert len(texts(a1)) == 1 and "board link" in texts(a1)[0] and "milestone" in texts(a1)[0]
-    assert len(texts(a2)) == 1 and "board link" in texts(a2)[0] and "milestone" not in texts(a2)[0] and texts(a3) == []
+    two = "This fixes #91."  # adoptable, but no `Closes #N`/`Refs #N` line and no milestone
+    r, a1 = poll(rnd(), prs=[pr(body=two, milestone=None)])
+    r, a2 = poll(r, view={"headRefOid": HEAD, "state": "OPEN", "body": two + "\nMilestone: R2", "milestone": None})
+    r, a3 = poll(r, view={"headRefOid": HEAD, "state": "OPEN", "body": two + "\nMilestone: R2", "milestone": None})
+    assert len(texts(a1)) == 1 and "Refs #N" in texts(a1)[0] and "milestone" in texts(a1)[0]
+    assert len(texts(a2)) == 1 and "Refs #N" in texts(a2)[0] and "milestone" not in texts(a2)[0] and texts(a3) == []
     assert len({p["id"] for p in r.pending}) == 2
 
 
 def test_a_closed_view_queues_no_hygiene_post():
-    r, actions = poll(rnd(pr={"number": 95, "head": HEAD, "state": "OPEN"}), view={"headRefOid": HEAD, "state": "CLOSED", "body": "Refs #91"})
+    r, actions = poll(rnd(pr={"number": 95, "head": HEAD, "state": "OPEN"}), view={"headRefOid": HEAD, "state": "CLOSED", "body": "Refs #91", "milestone": None})
     assert not r.pr.get("number") and not any("R23" in t for t in texts(actions))
     assert not any("R23" in p["text"] for p in r.pending) and {p["id"] for p in r.pending} == {a.id for a in actions if a.kind == "post"}
 
 
 def test_adopted_then_closed_in_one_poll_queues_no_hygiene_post():
-    r, actions = poll(rnd(), prs=[pr(body="Refs #91")], view={"headRefOid": HEAD, "state": "CLOSED"})
+    r, actions = poll(rnd(), prs=[pr(body="Refs #91", milestone=None)], view={"headRefOid": HEAD, "state": "CLOSED"})
     assert not any("R23" in p["text"] for p in r.pending) and {p["id"] for p in r.pending} == {a.id for a in actions if a.kind == "post"}
+
+
+# -- fm-wave-h-rulings 1: a wave job's PR needs a Closes/Refs line and a milestone; a study PR the full R23 block ------
+def test_a_refs_only_wave_pr_with_a_milestone_line_gets_no_post():
+    r, a1 = poll(rnd(), prs=[pr(body="Refs #91 #93\nMilestone: R2", milestone=None)])
+    assert r.pr["number"] == 95 and texts(a1) == [] and not any("R23" in f for f in r.findings)
+
+
+def test_a_refs_only_wave_pr_with_a_github_milestone_gets_no_post():
+    r, a1 = poll(rnd(), prs=[pr(body="Refs #91", milestone={"title": "R2"})])
+    r, a2 = poll(r, view={"headRefOid": HEAD, "state": "OPEN", "body": "Refs #91"})  # a read without the field: no gap
+    assert texts(a1) == [] and texts(a2) == [] and not any("R23" in f for f in r.findings)
+
+
+def test_a_wave_pr_without_a_closes_or_refs_line_gets_one_post():
+    r, a1 = poll(rnd(pr={"number": 95, "head": HEAD, "state": "OPEN"}), view={"headRefOid": HEAD, "state": "OPEN", "body": "Wave H job 4\nMilestone: R2"})
+    assert len(texts(a1)) == 1 and "Closes #N or Refs #N" in texts(a1)[0] and "milestone" not in texts(a1)[0].split(":", 1)[1]
+
+
+def test_a_study_pr_keeps_the_full_r23_block():
+    r, _ = poll(rnd(etas=False), prs=[pr(body="Refs #91\nMilestone: R2", milestone={"title": "R2"})])
+    (f,) = [f for f in r.findings if "R23" in f]
+    assert "Closes #N" in f and "study thread" in f and "board link" in f and "milestone" not in f
 
 
 # -- (3) approved_at is the approving review's submitted_at, tied to its head ----------------
@@ -140,6 +163,32 @@ def test_approved_at_is_dropped_when_the_head_moves():
 def test_approved_at_follows_the_approval_of_the_new_head():
     r, _ = poll(rnd("CodeAudit", pr={"number": 95, "head": NEW, "state": "OPEN"}), view={"headRefOid": NEW, "state": "OPEN"},
                 reviews=[rv(1, "APPROVED", HEAD, "2026-10-12T18:00:00Z"), rv(2, "APPROVED", NEW, "2026-10-12T18:30:00Z")])
+    assert r.pr["approved_at"] == 1791829800.0
+
+
+def test_approved_at_is_the_first_approval_on_the_head():
+    r, _ = poll(rnd("CodeAudit", pr={"number": 95, "head": HEAD, "state": "OPEN"}), view={"headRefOid": HEAD, "state": "OPEN"},
+                reviews=[rv(1, "APPROVED", HEAD, "2026-10-12T18:00:00Z"), rv(2, "APPROVED", HEAD, "2026-10-12T18:30:00Z")])
+    assert r.pr["approved_at"] == 1791828000.0
+
+
+def test_a_re_approval_of_the_same_head_does_not_move_approved_at():
+    base = rnd("CodeAudit", pr={"number": 95, "head": HEAD, "state": "OPEN"})
+    r, _ = poll(base, view={"headRefOid": HEAD, "state": "OPEN"}, reviews=[rv(1, "APPROVED", HEAD, "2026-10-12T18:00:00Z")])
+    r, _ = poll(r, view={"headRefOid": HEAD, "state": "OPEN"}, reviews=[rv(1, "APPROVED", HEAD, "2026-10-12T18:00:00Z"), rv(2, "APPROVED", HEAD, "2026-10-12T18:40:00Z")])
+    assert r.pr["approved_at"] == 1791828000.0
+    r, _ = poll(r, view={"headRefOid": HEAD, "state": "OPEN"})  # a poll without reviews keeps it
+    assert r.pr["approved_at"] == 1791828000.0
+
+
+def test_changes_requested_or_dismissal_pops_approved_at_and_a_later_approval_starts_again():
+    base = rnd("CodeAudit", pr={"number": 95, "head": HEAD, "state": "OPEN"})
+    a1, cr = rv(1, "APPROVED", HEAD, "2026-10-12T18:00:00Z"), rv(2, "CHANGES_REQUESTED", HEAD, "2026-10-12T18:10:00Z")
+    r, _ = poll(base, view={"headRefOid": HEAD, "state": "OPEN"}, reviews=[a1, cr])
+    assert "approved_at" not in r.pr
+    r, _ = poll(r, view={"headRefOid": HEAD, "state": "OPEN"}, reviews=[a1, cr, rv(3, "APPROVED", HEAD, "2026-10-12T18:20:00Z")])
+    assert r.pr["approved_at"] == 1791829200.0
+    r, _ = poll(base, view={"headRefOid": HEAD, "state": "OPEN"}, reviews=[rv(1, "DISMISSED", HEAD, "2026-10-12T18:00:00Z"), rv(2, "APPROVED", HEAD, "2026-10-12T18:30:00Z")])
     assert r.pr["approved_at"] == 1791829800.0
 
 

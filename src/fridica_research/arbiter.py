@@ -46,8 +46,9 @@ the crew budget, silent findings and its ready post on entering Merge.
 
 Wave H (#91, #90, #89): a link to a PR on the round's repo, posted while no PR is recorded, sets `pr["candidate"]`, which the
 driver views and feeds as `prs`; a candidate that cannot be adopted gets one post saying why (author, state or keyword). A PR is
-checked for the R23 lines whenever its body is read, posting once; a field the read lacks is no gap. `pr["approved_at"]` is the approving
-review's `submitted_at` while it approves the current head. A wave job's board write carries `eta_text` in its dates.
+checked for the R23 lines whenever its body is read, posting once; a field the read lacks is no gap. `pr["approved_at"]` is the first approving
+review's `submitted_at` on the current head, kept while it approves (fm-wave-h-rulings 2). A wave job's PR needs only a
+`Closes #N`/`Refs #N` line and a milestone (fm-wave-h-rulings 1). A wave job's board write carries `eta_text` in its dates.
 
 Out of this slice: merge and the queue, per-role AI opt-in execution.
 """
@@ -264,13 +265,27 @@ def epoch(at: str) -> float | None:
 
 
 def hygiene(r: Round, p: dict) -> list[Action]:
-    """R23 on the recorded PR (#91), once per PR and gap list, whenever its body is read: one post to the implementer naming the missing lines."""
+    """R23 on the recorded PR (#91), once per PR and gap list, whenever its body is read: one post to the implementer naming the missing lines.
+    A wave job's PR needs only a `Closes #N`/`Refs #N` line and a milestone (fm-wave-h-rulings 1)."""
     if "body" not in p: return []
-    missing = contracts.pr_hygiene_missing(p.get("body") or "")
+    if r.etas:  # a wave job: a Closes/Refs line and a milestone (fm-wave-h-rulings 1); a study PR keeps the full R23 block
+        ms = None if "milestone" not in p else str((p.get("milestone") or {}).get("title") or "")
+        missing = contracts.wave_pr_hygiene_missing(p.get("body") or "", ms)
+    else: missing = contracts.pr_hygiene_missing(p.get("body") or "")
     finding = f"PR #{r.pr['number']} lacks the R23 lines: {', '.join(missing)}"
     if not missing or finding in r.findings: return []
     gaps = "+".join(re.sub(r"\W+", "-", g.lower()).strip("-") for g in missing)  # the gap list is in the key: a changed list posts again
     return blocking(r, finding, f"hygiene/{r.pr['number']}/{gaps}", (r.holders("implementer") or [""])[0])
+
+
+def first_approval(reviews: list[dict], auditor: str, head: str) -> float | None:
+    """The earliest `submitted_at` of the auditor's approvals on `head` since their last CHANGES_REQUESTED or DISMISSED there:
+    a re-approval of the same head does not move it (fm-wave-h-rulings 2)."""
+    start: float | None = None
+    for v in sorted((v for v in reviews if str(v.get("login", "")).lower() == (auditor or "").lower() and v.get("commit") == head), key=lambda v: (v.get("at") or "", v.get("n") or 0)):
+        if v.get("state") == "APPROVED" and start is None: start = epoch(v.get("at") or "")
+        elif v.get("state") in ("CHANGES_REQUESTED", "DISMISSED"): start = None
+    return start
 
 
 def approved(r: Round) -> bool:
@@ -440,7 +455,9 @@ def polled(r: Round, ev: Event, cfg: Config) -> tuple[Round, list[Action]]:
         rv = max(verdicts, key=lambda v: (v["at"], v["n"])) if verdicts else None
         r.pr["review"] = {"id": rv["id"], "state": rv["state"], "commit": rv["commit"], "login": rv["login"], "at": rv.get("at") or ""} if rv else {}
     rv, head = r.pr.get("review") or {}, r.pr.get("head")
-    at = epoch(rv.get("at") or "") if approved(r) else None  # #90: the approving review's own time, kept only while it approves this head
+    at = None  # #90: kept only while the auditor approves this head; the first approval of that run (fm-wave-h-rulings 2)
+    if approved(r):
+        at = first_approval(ev["reviews"], r.login("auditor", cfg), head) if ev.get("reviews") is not None else r.pr.get("approved_at", epoch(rv.get("at") or ""))
     if at is None: r.pr.pop("approved_at", None)
     else: r.pr["approved_at"] = at
     if r.stage in PR_STAGES and rv.get("state") == "CHANGES_REQUESTED" and rv.get("commit") == head and r.pr.get("changes_requested") != rv["id"]:

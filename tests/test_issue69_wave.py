@@ -209,8 +209,7 @@ def test_a_jobs_round_behaves_as_the_arbiters_round_and_posts_go_to_the_wave_thr
     assert "Implement" in w.jobs[0].rnd().held  # held until a PR is recorded, as in slice 2
     assert [a["kind"] for a in actions] == ["post"] and "held: no PR" in actions[0]["text"] and actions[0]["thread"] == THREAD  # one blocking post (#92)
     w, actions = fold(w, [polled(1, T0 + H, prs=[pr(71, "imp1", 69)])])
-    assert [a["kind"] for a in actions] == ["post", "board_update"] and "lacks the R23 lines" in actions[0]["text"]  # #91: hygiene, once
-    assert actions[1]["thread"] == THREAD and actions[1]["id"].startswith(f"{THREAD}:job1/round/Implement-CodeAudit/board/")
+    assert [a["kind"] for a in actions] == ["board_update"] and actions[0]["thread"] == THREAD and actions[0]["id"].startswith(f"{THREAD}:job1/round/Implement-CodeAudit/board/")
     assert w.jobs[0].rnd().stage == "CodeAudit" and w.jobs[1].rnd().stage == "Implement"
     w, actions = fold(w, [post("2", PEOPLE["imp2"], "Handing off.\nhttps://example.org/y\nDue 10-12 09:00 ET", T0 + H), polled(2, T0 + 2 * H, prs=[pr(72, "imp2", 54)])])
     fix = [a for a in actions if a["kind"] == "post" and "/mention/" in a["id"]]
