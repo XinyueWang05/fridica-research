@@ -1,11 +1,11 @@
 """Pinned JSON and text contracts between the driver and fridica.
 
-These target fridica #126 PR B (external-driver surface). As of fridica 0.4.0-dev
-the three POST routes, the `job_result` and `peer_post` event kinds and the
-`threads.driver` flag are **not yet served**; the shapes here are the Python
-side's pin so the package is testable against the fake server in `tests/`.
-Everything else (GET /events, GET /threads/<id>, `message`/`outbox`/`job`
-events, Slack metadata keys) is what the daemon serves today.
+These target fridica #126 PR B (external-driver surface), which landed in
+chengcli/fridica#133 (merge dc0cf027): the three POST routes, the `job_result` and
+`peer_post` event kinds and the `threads.driver` flag are served. The shapes here are
+the Python side's pin, so the package is also testable against the fake server in
+`tests/`. GET /events, GET /threads/<id>, `message`/`outbox`/`job` events and the
+Slack metadata keys are served as before.
 
 Slack metadata keys are fixed (`v, owner, session, turn, status, kind, worker`),
 so every correlation datum the driver needs travels as a readable text line:

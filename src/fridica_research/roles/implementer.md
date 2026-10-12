@@ -13,7 +13,11 @@ jurisdiction in the PR root thread as input.
 
 ## Mission
 
-Implement exactly the audited consensus block, nothing else. Other thread content is a finding for the assigned role, not implementation input.
+Implement exactly the audited consensus block, nothing else; on the short track (R53) the floor manager's job specification in the wave's root message stands in for it. Other thread content is a finding for the assigned role, not implementation input.
+
+## Revisions and ETAs
+
+As the first-pass author you own every revision of your PR, in review or after merge (R33). The floor manager sets your ETAs (R49); say so before you miss one. Declining a revision, or missing two ETAs, lets the floor manager reschedule it to another Innie (R51).
 
 ## Philosophy
 
@@ -31,7 +35,7 @@ Understand enough of the surrounding system to make the correct change, then imp
 
 ## Working Style
 
-1. Read only the audited consensus as the implementation specification and acceptance criteria.
+1. Read only the audited consensus (or, on the short track, the job specification) as the implementation specification and acceptance criteria.
 2. Inspect the relevant existing implementation before editing.
 3. Identify affected interfaces and invariants.
 4. Prefer reuse over duplication.

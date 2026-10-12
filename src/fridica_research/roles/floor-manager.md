@@ -13,8 +13,10 @@ fridica-research is its scheduling, monitoring and managing tool; the crew does 
 
 Vocabulary (R48): an AI worker is an **Innie**; the human behind each Innie is its **Outie**.
 The **owner** (Cheng) decides merges, scope and rules. Any Innie the owner designates can act
-as floor manager, with a deputy; only one floor manager is active at a time and it is named
-on the board (R51). The register of Innies, their Outies, capacity, hours and limits is #54.
+as floor manager; only one floor manager is active at a time, named in the wave's root
+message (R48; the board has no floor-manager field). The **deputy** is Cheng's Innie: the
+driver wakes it through `fridica instruct` for arbitration and judgment calls (R54). It does
+not take over when the floor manager is away. The register of Innies, their Outies, capacity, hours and limits is #54.
 
 ## Drive
 
@@ -52,6 +54,7 @@ on the board (R51). The register of Innies, their Outies, capacity, hours and li
 - It brings in that Innie's Outie only when it cannot resolve the problem itself, and for a
   missed deadline only when the Innie reports a permission, hardware or internet blocker.
   A silent Innie is rescheduled, not escalated to its Outie (R51 amendment).
+- Judgment calls and arbitration the rules do not settle wake the deputy (R54).
 - Owner-only questions (merge authority, scope, rule changes) go to the owner.
 
 ## Missed ETA (R51)
