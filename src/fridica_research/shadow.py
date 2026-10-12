@@ -31,7 +31,12 @@ API_VALUE_FLAGS = {"-X", "--method", "--jq", "-q", "--template", "-t", "--cache"
 
 def api_flags(args: list[str]) -> list[tuple[str, str | None]]:
     """`gh api` flags as (name, value): `--name=v`, `-Xv` glued, or the value in the next token."""
-    out, i = [], 0
+    return api_args(args)[0]
+
+
+def api_args(args: list[str]) -> tuple[list[tuple[str, str | None]], list[str]]:
+    """`gh api` arguments as (flags, positionals); a flag's value (glued, `=`, or the next token) is never a positional."""
+    out, pos, i = [], [], 0
     while i < len(args):
         a = args[i]
         if a.startswith("--"):
@@ -43,22 +48,28 @@ def api_flags(args: list[str]) -> list[tuple[str, str | None]]:
             if val is not None and name not in API_VALUE_FLAGS: name, val = a, None  # a cluster (-iXPOST, -ifbody=x): unknown, so a write
             elif val is None and name in API_VALUE_FLAGS and i + 1 < len(args): val, i = args[i + 1], i + 1
             out.append((name, val))
+        else: pos.append(a)
         i += 1
-    return out
+    return out, pos
 
 
 def is_read(argv: list[str], stdin: str | None = None) -> bool:
     """True only for the listed gh reads; anything else (and anything that is not gh) is a write. It fails closed: a
-    `gh api` call is a read only as a GET (`-X`/`--method`, glued or not) whose every flag is a known read flag. A graphql
-    call is judged by its query, in argv (`-f query=...`) or on stdin (`--input -`, as `board.Projects.graphql` sends it)."""
+    `gh api` call is a read only as a GET (`-X`/`--method`, glued or not) whose every flag is a known read flag. Its
+    endpoint is the first positional argument after `api`; only when that is `graphql` is the call judged by its query, in
+    argv (`-f query=...`) or on stdin (`--input -`, as `board.Projects.graphql` sends it). `--input <file>` and
+    `-F key=@file` read a file the shadow cannot see, so they are writes."""
     a = [str(x) for x in argv or []]
     if len(a) < 3 or a[0] != "gh": return False
     if a[1] in GH_READS: return a[2] in GH_READS[a[1]]
     if a[1] != "api": return False
-    flags = api_flags(a[2:])
+    flags, pos = api_args(a[2:])
+    if not pos: return False  # no endpoint: nothing known to be a read
     if any((v or "").upper() != "GET" for n, v in flags if n in ("-X", "--method")): return False
-    if "graphql" in a[2:]:
+    if pos[0] == "graphql":  # the endpoint is the first positional, never a flag's value (`-q graphql`)
         if any(n == "--input" and v != "-" for n, v in flags): return False  # a query in a file is not read here: a write
+        if any(n in ("-F", "--field") and (v or "").partition("=")[2].startswith("@") for n, v in flags): return False  # `-F query=@file`: a file read
+        if any(n not in API_READ_FLAGS and n not in API_VALUE_FLAGS for n, _ in flags): return False  # an unknown or clustered flag
         return not any("mutation" in x.lower() for x in [*a, stdin or ""])  # allowed unless it mutates
     return all(n in API_READ_FLAGS or n in ("-X", "--method") for n, _ in flags)
 
@@ -93,7 +104,7 @@ class Sink:
             lines = data.split(b"\n")
             offset = 0
             for n, raw in enumerate(lines, 1):
-                torn = n == len(lines) and raw.strip() != b""  # text after the last newline
+                torn = n == len(lines) and raw.strip() != b""  # text after the last newline: a torn row, or a whole row without its newline
                 if raw.strip():
                     try: row = json.loads(raw)
                     except (json.JSONDecodeError, UnicodeDecodeError):
@@ -103,6 +114,8 @@ class Sink:
                         break
                     if not isinstance(row, dict) or "key" not in row: raise SinkCorrupt(f"{self.path}: line {n} is not a sink row")
                     self.rows.append(row)
+                    if torn:  # a whole last row that only lost its newline: restore it, so the next row is not glued on
+                        with self.path.open("ab") as f: f.write(b"\n")
                 offset += len(raw) + 1
         self.keys = {r["key"] for r in self.rows}
 

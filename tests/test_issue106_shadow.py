@@ -337,3 +337,29 @@ def test_a_torn_last_line_reopens_with_a_warning(tmp_path, caplog):
     path = tmp_path / "s.jsonl"
     path.write_text('{"kind": "gh", "key": "k1"}\n{"kind": "gh", "ke')
     assert shadow.Sink(path).keys == {"k1"} and "line 2" in caplog.text and "torn" in caplog.text
+
+
+# -- Xi's findings on 6a3feb9 ------------------------------------------------------------------------------------------
+@pytest.mark.parametrize("argv", [
+    ["gh", "api", "repos/o/r/issues", "-F", "title=x", "-q", "graphql"], ["gh", "api", "-X", "POST", "repos/o/r/issues", "-q", "graphql"],
+    ["gh", "api", "graphql", "-F", "query=@q.graphql"], ["gh", "api", "graphql", "--field", "query=@q.graphql"], ["gh", "api", "graphql", "--field=query=@q.graphql"],
+    ["gh", "api", "graphql", "-Fquery=@q.graphql"], ["gh", "api", "-q", ".x", "--jq", "graphql", "repos/o/r/issues", "-f", "a=b"], ["gh", "api", "-q", "graphql"]])
+def test_the_endpoint_is_the_first_positional_and_field_files_are_writes(argv): assert not shadow.is_read(argv)
+
+
+def test_graphql_as_the_endpoint_still_reads_after_flags():
+    assert shadow.is_read(["gh", "api", "-H", "Accept: x", "graphql", "-f", "query=query { viewer { login } }"])
+    assert shadow.is_read(["gh", "api", "graphql", "-F", "owner=o", "-f", "query=query($owner:String!){ user(login:$owner){ id } }"])
+    assert shadow.is_read(["gh", "api", "-q", "graphql", "repos/o/r"])  # graphql as a --jq value, on a GET endpoint: a read
+
+
+def test_a_last_row_without_its_newline_is_kept_and_the_next_row_is_not_glued(tmp_path, caplog):
+    path = tmp_path / "s.jsonl"
+    sink = shadow.Sink(path)
+    for k in ("k1", "k2"): sink.record("gh", k, argv=["gh", "pr", "merge", k])
+    path.write_bytes(path.read_bytes()[:-1])  # only the final newline is lost
+    again = shadow.Sink(path)
+    assert again.keys == {"k1", "k2"}
+    again.record("gh", "k3", argv=["gh", "pr", "merge", "k3"])
+    assert shadow.Sink(path).keys == {"k1", "k2", "k3"} and path.read_bytes().endswith(b"\n")
+    assert "torn" not in caplog.text
