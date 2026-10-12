@@ -15,7 +15,7 @@ import subprocess
 import time
 from typing import Callable
 
-from . import arbiter, briefs, contracts, github, machine, provenance, wave as wave_mod
+from . import arbiter, briefs, contracts, deputy, github, ladder, machine, provenance, wave as wave_mod
 from .client import Client, ControlError, Unavailable
 from .config import Config
 from .machine import Action, Event, State
@@ -311,6 +311,7 @@ class Driver:
         if w is None: return False
         ev = round_event(e, self.clock())
         if ev is not None: self.wave_event(w, ev)
+        self.note_reply(w, str(e.get("sender") or ""))
         return True
 
     def wave_event(self, w: wave_mod.Wave, ev: Event) -> wave_mod.Wave:
@@ -376,6 +377,96 @@ class Driver:
                 w = self.wave_event(w, ev)
                 self.request_review(w, n, run)
             if reads: self.count_gh_failure(w, error)
+
+    # -- the R51 ladder for wave jobs (#83, #80, #92, #88) ---------------------------
+    def ladder_key(self, thread: str, n: int) -> str: return f"ladder:{wave_mod.job_thread(thread, n)}"
+
+    def ladder_meta(self, thread: str, n: int) -> dict:
+        raw = self.store.get_meta(self.ladder_key(thread, n))
+        return json.loads(raw) if raw else {}
+
+    def save_ladder(self, thread: str, n: int, m: dict): self.store.set_meta(self.ladder_key(thread, n), json.dumps(m, sort_keys=True))
+
+    @staticmethod
+    def ladder_stage(j: wave_mod.Job) -> tuple[str, str, float | None, float | None, bool]:
+        """(stage, holder, eta, start, deliverable): the implementer toward `pr_eta` until a PR is recorded, then the auditor toward `review_eta`."""
+        if not (j.round.get("pr") or {}).get("number") and "pr" not in j.delivered:
+            return "pr", j.person("implementer").get("slack", ""), j.pr_eta, j.input_at, False
+        return "review", j.person("auditor").get("slack", ""), j.review_eta, j.delivered.get("pr", j.input_at), "review" in j.delivered
+
+    def note_reply(self, w: wave_mod.Wave, sender: str):
+        """`last_reply` on the driver clock for each open job the sender holds (the Slack ts is not compared with driver times)."""
+        if not sender or sender == self.cfg.owner: return
+        for n, j in enumerate(w.jobs, 1):
+            m = self.ladder_meta(w.thread, n)
+            if j.terminal or not m or m.get("key", [None, None])[1] != sender: continue
+            m["last_reply"] = self.clock()
+            self.save_ladder(w.thread, n, m)
+
+    def tick_waves(self):
+        """One ladder step per open job of each open wave, after `poll_waves`. The state lives in `ladder:<thread>:job<N>`,
+        keyed on (stage, holder, eta); a new key resets `done` and `checkin_at`. Besides the ETA rungs: one deputy wake per
+        `Round.held` post still held W after it (#92), and one nudge to the job's auditor when their Slack SIGN-OFF approve
+        has no approving GitHub review on the head (#88). An action that fails stays out of `done` and is tried next pass."""
+        now = self.clock()
+        for thread in self.waves():
+            w = self.load_wave(thread)
+            if w is None or w.closed_at is not None: continue
+            for n, j in enumerate(w.jobs, 1):
+                if j.terminal: continue
+                stage, holder, eta, start, deliverable = self.ladder_stage(j)
+                if not holder or eta is None: continue
+                m, key = self.ladder_meta(thread, n), [stage, holder, eta]
+                if m.get("key") != key: m = {**m, "key": key, "done": [], "checkin_at": None}
+                est = max(float(eta) - float(start if start is not None else eta), 0.0)
+                v = ladder.JobView(ref=f"fm-wave-{w.name}-job{n}", holder=holder, owner=self.cfg.owner, est=est, eta=float(eta), deliverable=deliverable,
+                                   checkin_at=m.get("checkin_at"), last_reply=m.get("last_reply"), done=frozenset(m.get("done") or ()), thread=thread)
+                actions = ladder.step(v, now) + self.held_wakes(v, j, now) + self.review_nudge(v, j)
+                for a in actions:
+                    if a.id in m["done"] or self.execute_ladder(thread, a): continue
+                    m["done"] = m["done"] + [a.id]
+                    if a.id == f"{v.ref}/checkin": m["checkin_at"] = now
+                self.save_ladder(thread, n, m)
+
+    @staticmethod
+    def held_wakes(v: ladder.JobView, j: wave_mod.Job, now: float) -> list[Action]:
+        """#92: a blocking finding is an entry in `Round.held`; W runs from the held post's ts, one wake per held post."""
+        out = []
+        for stage, h in sorted((j.round.get("held") or {}).items()):
+            try: at = float(h.get("ts"))
+            except (TypeError, ValueError): continue
+            if now > at + ladder.window(v.est):
+                out.append(ladder.wake(v, f"{v.ref}/held/{h.get('ts')}", f"{stage} is held since {h.get('ts')}: {str(h.get('text', ''))[:300]}", {"stage": stage}))
+        return [a for a in out if a.id not in v.done]
+
+    @staticmethod
+    def review_nudge(v: ladder.JobView, j: wave_mod.Job) -> list[Action]:
+        """#88: the job's auditor (and only them) signed off approve on the head in Slack, but GitHub has no approving review there."""
+        rnd, aud = j.rnd(), j.person("auditor").get("slack", "")
+        head = str(rnd.pr.get("head") or "")
+        if not aud or not head or arbiter.approved(rnd): return []
+        if not any(so.get("sender") == aud and so.get("verdict") == "approve" and head.startswith(str(so.get("sha") or "-")) for so in rnd.pr.get("signoffs") or []): return []
+        ref = f"{v.ref}/gh-review/{head[:12]}"
+        text = f"<@{aud}> your SIGN-OFF approve on PR #{rnd.pr.get('number')} is in Slack, but GitHub has no approving review at {head[:12]}. Please submit it on GitHub."
+        return [] if ref in v.done else [Action("post", ref, {"thread": v.thread, "post_kind": ladder.POST_KIND, "to": aud, "text": f"{text}\nref: {ref}"})]
+
+    def execute_ladder(self, thread: str, a: Action) -> str | None:
+        """A ladder action: `wake_deputy` as an instruct with its client id; every other kind (`notify_owner` included,
+        whose text already mentions the owner) as a plain post of its text, probed by its `ref:` first. None when done."""
+        try:
+            if a.kind == "wake_deputy":
+                try: deputy.wake(self.client, a.get("thread") or thread, a.id, a["text"])
+                except Exception as e:  # noqa: BLE001 - a wake that did not go out stays out of `done`: the next pass tries it again
+                    log.warning("ladder wake %s failed: %s", a.id, e)
+                    return f"wake_deputy {a.id} failed: {e}"
+                return None
+            seen = self.posted_with_ref(thread, a.id)
+            if seen is None: return f"{a.kind} {a.id} skipped: the ref probe failed"
+            if not seen: self.client.post_message(thread, contracts.PostRequest(a.get("post_kind") or ladder.POST_KIND, a["text"]))
+        except ControlError as e:
+            log.warning("ladder %s %s failed: %s", a.kind, a.id, e)
+            return f"{a.kind} {a.id} refused: {e}"
+        return None
 
     def unwatched_merge(self, rnd: arbiter.Round, run, ev: Event, n: int, opened_at: float | None) -> Event:
         """#91: adoption found nothing, so look for the job's PR that merged while nobody was watching: MERGED at or after
@@ -456,6 +547,10 @@ class Driver:
 
     def read_pr(self, rnd: arbiter.Round, run) -> Event | None:
         now = self.clock()
+        if not rnd.pr.get("number") and rnd.pr.get("candidate"):  # job 4's candidate may be another author's PR: `list_prs --author` would miss it
+            view = github.view_pr(run, f"{rnd.repo}#{rnd.pr['candidate']}")
+            view.setdefault("number", int(rnd.pr["candidate"]))
+            return Event("pr_polled", now, {"prs": [view]})
         if not rnd.pr.get("number"):
             me = rnd.login("implementer", self.cfg)
             if not me: return None  # whose PR is "own" is unknown: nothing to adopt
@@ -526,6 +621,7 @@ class Driver:
         self.fire_timers()
         self.poll_rounds()
         self.poll_waves()
+        self.tick_waves()
         self.poll_github()
         return n, int(page.get("scanned", 0)) < 1000
 
