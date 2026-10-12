@@ -44,6 +44,11 @@ unmerged) is also one durable post to its author. "ready to merge" waits until t
 Merge that the auditor has not approved sends the round back to CodeAudit with its old ETA. An adopted round keeps
 the crew budget, silent findings and its ready post on entering Merge.
 
+Wave H (#91, #90, #89): a link to a PR on the round's repo, posted while no PR is recorded, sets `pr["candidate"]`, which the
+driver views and feeds as `prs`; a candidate that cannot be adopted gets one post saying why (author, state or keyword). A PR is
+checked for the R23 lines whenever its body is read, posting once; a field the read lacks is no gap. `pr["approved_at"]` is the approving
+review's `submitted_at` while it approves the current head. A wave job's board write carries `eta_text` in its dates.
+
 Out of this slice: merge and the queue, per-role AI opt-in execution.
 """
 from __future__ import annotations
@@ -79,6 +84,7 @@ _RECIPIENT = r"(?:you\b|<@[UW][A-Z0-9]+>|(?:the|our)\s+(?:%s)\b)" % "|".join(sor
 HANDOFF_MARK = re.compile(r"hand[-\s]?off|hand(?:s|ed|ing)[-\s]+(?:it |this )?(?:off|over)|\ball yours\b"
                           rf"|\bover to\s+{_RECIPIENT}|\bpass(?:ing|es|ed)?[-\s]+(?:it|this)[-\s]+(?:on[-\s]+)?to\s+{_RECIPIENT}", re.I)
 MENTION = re.compile(r"<@([UW][A-Z0-9]+)>")
+PULL_LINK = re.compile(r"https://github\.com/(?P<repo>[\w.-]+/[\w.-]+)/pull/(?P<n>\d+)")
 LINK = re.compile(r"https://[^\s<>|)\]]+")
 DUE = re.compile(r"\b(?:due|eta)\b[^\n]{0,40}?(?P<when>\d{1,2}-\d{1,2}\s+\d{1,2}:\d{2}\s*(?:ET|EST|EDT))", re.I)
 SLACK_ID = re.compile(r"^[UW][A-Z0-9]{2,}$")
@@ -234,6 +240,38 @@ def pick_pr(r: Round, prs: list[dict], cfg: Config | None = None) -> dict | None
     return min(ok, key=lambda p: int(p["number"])) if ok else None
 
 
+def candidate_of(r: Round, text: str) -> int | None:
+    """The first PR on the round's own repo that `text` links to (#91): the adoption candidate."""
+    return next((int(m.group("n")) for m in PULL_LINK.finditer(text or "") if r.repo and m.group("repo").lower() == r.repo.lower()), None)
+
+
+def why_not(r: Round, p: dict, cfg: Config | None = None) -> list[str]:
+    """Why `pick_pr` refuses the candidate `p`. A field the read did not carry is no gap."""
+    me, out = r.login("implementer", cfg), []
+    if "author" in p and str((p.get("author") or {}).get("login", "")).lower() != me.lower():
+        out.append(f"its author is {(p.get('author') or {}).get('login') or '(none)'}, not the implementer {me or '(login unset)'}")
+    if "state" in p and str(p.get("state") or "").upper() != "OPEN": out.append(f"it is {str(p.get('state')).lower()}")
+    if "body" in p and not closes_or_refs(p.get("body") or "", r.issue, r.repo):
+        out.append(f"its body has no closing keyword or `Refs` before #{r.issue}")
+    return out
+
+
+def epoch(at: str) -> float | None:
+    """An ISO time as epoch seconds (UTC when it names no zone); None when it is empty or unreadable."""
+    try: t = dt.datetime.fromisoformat(str(at).replace("Z", "+00:00"))
+    except ValueError: return None
+    return (t if t.tzinfo else t.replace(tzinfo=dt.timezone.utc)).timestamp()
+
+
+def hygiene(r: Round, p: dict) -> list[Action]:
+    """R23 on the recorded PR (#91), once per PR and gap list, whenever its body is read: one post to the implementer naming the missing lines."""
+    if "body" not in p: return []
+    missing = contracts.pr_hygiene_missing(p.get("body") or "")
+    finding = f"PR #{r.pr['number']} lacks the R23 lines: {', '.join(missing)}"
+    if not missing or finding in r.findings: return []
+    return blocking(r, finding, f"hygiene/{r.pr['number']}", (r.holders("implementer") or [""])[0])
+
+
 def approved(r: Round) -> bool:
     """The auditor's latest verdict is APPROVED on the PR's current head; a head change makes it stale."""
     rv = r.pr.get("review") or {}
@@ -278,6 +316,7 @@ def observe(rnd: Round, ev: Event, cfg: Config) -> tuple[Round, list[Action]]:
     so = contracts.parse_signoff(text)
     if so is not None:  # recorded on the PR, never a clearance: CodeAudit clears on the GitHub review alone
         r.pr["signoffs"] = (r.pr.get("signoffs") or []) + [{"ts": ts, "sender": sender, "pr": so.pr, "sha": so.sha, "verdict": so.verdict}]
+    if not r.pr.get("number") and candidate_of(r, text): r.pr["candidate"] = candidate_of(r, text)  # #91: the driver views it next pass
     if not HANDOFF_MARK.search(text): return r, []  # a progress post is not a hand-off
     stage = r.stage
     nxt = next_stage(r, stage)
@@ -365,8 +404,18 @@ def polled(r: Round, ev: Event, cfg: Config) -> tuple[Round, list[Action]]:
     actions: list[Action] = []
     if not r.pr.get("number"):
         p = pick_pr(r, ev.get("prs") or [], cfg)
-        if p is None: return r, []
+        if p is None:
+            c = r.pr.get("candidate")
+            seen = next((x for x in ev.get("prs") or [] if c and int(x.get("number") or 0) == int(c)), None)
+            why = why_not(r, seen, cfg) if seen else []
+            finding = f"{r.stage}: PR #{c} is not adopted: {'; '.join(why)}"
+            if why and finding not in r.findings:
+                actions = blocking(r, finding, f"candidate/{c}", (r.holders("implementer") or [""])[0])
+                return r, actions
+            return r, []
+        r.pr.pop("candidate", None)
         r.pr.update({"number": int(p["number"]), "head": p.get("headRefOid", ""), "state": p.get("state", "OPEN"), "draft": bool(p.get("isDraft"))})
+        actions += hygiene(r, p)
     moved = False
     if ev.get("view"):
         v = ev["view"]
@@ -375,6 +424,7 @@ def polled(r: Round, ev: Event, cfg: Config) -> tuple[Round, list[Action]]:
         for k, bad in (("mergeable", ("CONFLICTING",)), ("checks", ("FAILURE", "PENDING"))):  # #90: a view without the field does not block
             if k in v: r.pr[k] = v[k]
             elif str(r.pr.get(k) or "").upper() in bad: r.pr.pop(k)
+        if r.pr.get("number"): actions += hygiene(r, v)
         if str(v.get("state", "")).upper() == "CLOSED" and not v.get("mergedAt"):
             # closed without merging: drop it, keep the stage, and let the next poll adopt the implementer's next open PR
             n = r.pr["number"]
@@ -385,8 +435,11 @@ def polled(r: Round, ev: Event, cfg: Config) -> tuple[Round, list[Action]]:
         auditors = {r.login("auditor", cfg).lower()} - {""}
         verdicts = [v for k, v in latest_verdicts(ev["reviews"]).items() if k in auditors]
         rv = max(verdicts, key=lambda v: (v["at"], v["n"])) if verdicts else None
-        r.pr["review"] = {"id": rv["id"], "state": rv["state"], "commit": rv["commit"], "login": rv["login"]} if rv else {}
+        r.pr["review"] = {"id": rv["id"], "state": rv["state"], "commit": rv["commit"], "login": rv["login"], "at": rv.get("at") or ""} if rv else {}
     rv, head = r.pr.get("review") or {}, r.pr.get("head")
+    at = epoch(rv.get("at") or "") if approved(r) else None  # #90: the approving review's own time, kept only while it approves this head
+    if at is None: r.pr.pop("approved_at", None)
+    else: r.pr["approved_at"] = at
     if r.stage in PR_STAGES and rv.get("state") == "CHANGES_REQUESTED" and rv.get("commit") == head and r.pr.get("changes_requested") != rv["id"]:
         # in CodeAudit the round goes back to Implement; in Implement it stays there, and the implementer is still told
         r.pr["changes_requested"] = rv["id"]
@@ -448,7 +501,7 @@ def board_action(r: Round, stage: str, nxt: str, nrole: str, ts: str, cfg: Confi
     return Action("board_update", f"{r.thread}/round/{stage}-{nxt}/board/{ts}", {
         "thread": r.thread, "issue": r.issue, "repo": r.repo,
         "options": {"Stage": BOARD_STAGE.get(nxt, nxt), "Role": nrole, "Status": "In Progress"},
-        "dates": {"started": day(r.stage_started), "projected_finish": day(r.due)},
+        "dates": {"started": day(r.stage_started), "projected_finish": day(r.due), **({"eta_text": eta_line(r.due)} if r.etas else {})},
         "assignee": assignee,
         "remove_assignees": [previous] if previous and previous != assignee else [],
     })
