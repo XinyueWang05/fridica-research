@@ -13,11 +13,15 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
+import logging
 import re
 import time
 from pathlib import Path
 
 from . import contracts
+from .machine import ts_key
+
+log = logging.getLogger("fridica_research.shadow")
 
 GH_READS = {"pr": {"view", "list", "checks", "diff", "status"}, "issue": {"view", "list"}, "project": {"view", "list", "field-list", "item-list"}}
 API_BODY_FLAGS = {"-f", "-F", "--field", "--raw-field", "--input"}
@@ -36,7 +40,8 @@ def api_flags(args: list[str]) -> list[tuple[str, str | None]]:
             out.append((name, val if (eq or name in API_VALUE_FLAGS) else None))
         elif a.startswith("-") and len(a) > 1:
             name, val = a[:2], a[2:] or None
-            if val is None and name in API_VALUE_FLAGS and i + 1 < len(args): val, i = args[i + 1], i + 1
+            if val is not None and name not in API_VALUE_FLAGS: name, val = a, None  # a cluster (-iXPOST, -ifbody=x): unknown, so a write
+            elif val is None and name in API_VALUE_FLAGS and i + 1 < len(args): val, i = args[i + 1], i + 1
             out.append((name, val))
         i += 1
     return out
@@ -53,6 +58,7 @@ def is_read(argv: list[str], stdin: str | None = None) -> bool:
     flags = api_flags(a[2:])
     if any((v or "").upper() != "GET" for n, v in flags if n in ("-X", "--method")): return False
     if "graphql" in a[2:]:
+        if any(n == "--input" and v != "-" for n, v in flags): return False  # a query in a file is not read here: a write
         return not any("mutation" in x.lower() for x in [*a, stdin or ""])  # allowed unless it mutates
     return all(n in API_READ_FLAGS or n in ("-X", "--method") for n, _ in flags)
 
@@ -60,28 +66,56 @@ def is_read(argv: list[str], stdin: str | None = None) -> bool:
 def digest(*parts) -> str: return hashlib.sha256(json.dumps(parts, sort_keys=True, default=str).encode()).hexdigest()
 
 
+class SinkCorrupt(ValueError):
+    """A line of the sink that is not JSON and is not the torn last line: the record of what was written is damaged."""
+
+
+def ts_after(at: float, last: str | None) -> str:
+    """`at` as a Slack ts (`f"{at:.6f}"`), bumped by 1 us while it is not after `last`."""
+    ts = f"{at:.6f}"
+    if last is None or ts_key(ts) > ts_key(last): return ts
+    sec, us = ts_key(last)
+    us += 1
+    return f"{sec + us // 1_000_000}.{us % 1_000_000:06d}"
+
+
 class Sink:
-    """One JSON line per would-be write at `path`; each key is written once, across restarts."""
+    """One JSON line per would-be write at `path`; each key is written once, across restarts. Each row carries a
+    Slack-style ts from the clock's microseconds, strictly after every earlier row's, so shadow posts sort among the
+    thread's real posts. On reopen a torn last line (no newline: the process died mid-write) is logged, cut off the
+    file and its write redone; any other line that is not JSON raises `SinkCorrupt` with its line number."""
 
     def __init__(self, path, clock=time.time):
         self.path, self.clock = Path(path), clock
         self.rows: list[dict] = []
         if self.path.exists():
-            for line in self.path.read_text().splitlines():
-                try: row = json.loads(line) if line.strip() else None
-                except json.JSONDecodeError: row = None  # a line half-written when the process died: skipped, its write is redone
-                if isinstance(row, dict) and "key" in row: self.rows.append(row)
+            data = self.path.read_bytes()
+            lines = data.split(b"\n")
+            offset = 0
+            for n, raw in enumerate(lines, 1):
+                torn = n == len(lines) and raw.strip() != b""  # text after the last newline
+                if raw.strip():
+                    try: row = json.loads(raw)
+                    except (json.JSONDecodeError, UnicodeDecodeError):
+                        if not torn: raise SinkCorrupt(f"{self.path}: line {n} is not valid JSON; the shadow record is damaged") from None
+                        log.warning("shadow sink %s: torn last line %d skipped and cut (the process died mid-write); its write is redone", self.path, n)
+                        with self.path.open("r+b") as f: f.truncate(offset)
+                        break
+                    if not isinstance(row, dict) or "key" not in row: raise SinkCorrupt(f"{self.path}: line {n} is not a sink row")
+                    self.rows.append(row)
+                offset += len(raw) + 1
         self.keys = {r["key"] for r in self.rows}
+
+    def last_ts(self) -> str | None:
+        return max((r["ts"] for r in self.rows if r.get("ts")), key=ts_key, default=None)
 
     def record(self, kind: str, key: str, **fields) -> bool:
         """Append the action unless its key is already in the sink; True when it was new."""
         if key in self.keys: return False
         at = self.clock()
-        row = {"at": at, "ts": f"{int(at)}.{len(self.rows) + 1:06d}", "kind": kind, "key": key, **fields}  # a Slack-style ts, unique per row
+        row = {"at": at, "ts": ts_after(at, self.last_ts()), "kind": kind, "key": key, **fields}
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self.path.open("a") as f:
-            if f.tell() and not self.path.read_bytes().endswith(b"\n"): f.write("\n")  # end a torn line before appending
-            f.write(json.dumps(row, sort_keys=True) + "\n")
+        with self.path.open("a") as f: f.write(json.dumps(row, sort_keys=True) + "\n")
         self.rows.append(row)
         self.keys.add(key)
         return True

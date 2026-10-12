@@ -8,6 +8,7 @@ the real one: the shadow wave is opened with `wave open ... --state`. `wave eta`
 """
 from __future__ import annotations
 
+import dataclasses
 import json
 
 import pytest
@@ -264,3 +265,75 @@ def test_restart_through_a_claim_finds_the_shadow_post_and_its_ts_sorts(world, t
     assert [r["ref"] for r in rows if r["kind"] == "post_message"] == [ref]
     assert s2.claim["status"] == "settling" and s2.claim["ts"] == rows[0]["ts"] and ts_key(s2.claim["ts"])
     assert sum(1 for m in server.view(thread)["messages"] if m["meta"] and m["meta"]["kind"] == "study_claim") == claims_before
+
+
+# -- Xi's findings on bebdf38 ------------------------------------------------------------------------------------------
+class CorpusReal(Real):
+    """The daemon as corpus 006 leaves it: the peer's claim at 1700000000.000700 is in the thread, ours is not."""
+
+    def __init__(self, peer: dict):
+        super().__init__()
+        self.messages = [{"ts": peer["ts"], "sender": peer["sender"], "text": peer["text"]}]
+
+
+def test_corpus_006_restarted_in_shadow_loses_the_claim_as_recorded(tmp_path):
+    from pathlib import Path
+    from fridica_research import replay
+    from fridica_research.driver import Driver
+    cfg, start, events, _, final = replay.load(Path(__file__).parent / "bootstrap" / "006_peer_claim_conflict")
+    i = next(k for k, e in enumerate(events) if e.kind == "peer_post")
+    state, _ = replay.fold(cfg, start, events[: i + 1])  # our alpha claim is waiting to be posted; the peer claimed alpha first
+    assert state.waiting and state.waiting["kind"] == "post" and state.claim["slug"] == "alpha"
+    cfg = dataclasses.replace(cfg, state_path=str(tmp_path / "shadow.sqlite3"))
+    store = Store(cfg.state_file)
+    store.save(state)
+    store.close()
+    clock = lambda: 1_700_000_000.9  # noqa: E731
+    path = tmp_path / "s.jsonl"
+    for _ in range(2):  # the post goes to the sink; the restart's recover finds it there through own_post_with_ref
+        d = Driver(cfg, shadow.ShadowClient(CorpusReal(events[i].data), shadow.Sink(path, clock=clock), owner=cfg.owner), Store(cfg.state_file), llm=lambda *a: {}, clock=clock, sleep=lambda s: None)
+        d.recover()
+    s = d.store.load(state.thread)
+    rows = [json.loads(line) for line in path.read_text().splitlines()]
+    assert rows[0]["ts"] == "1700000000.900000"
+    assert s.peer_claims["alpha"]["ts"] == final["peer_claims"]["alpha"]["ts"] and s.claim["slug"] != "alpha"  # we lose alpha, as the corpus records
+
+
+def test_ts_is_the_clock_microsecond_and_strictly_increasing(tmp_path):
+    from fridica_research.machine import ts_key
+    t = [1_700_000_000.0000001, 1_700_000_000.0000004, 1_699_999_999.0]  # same microsecond twice, then a clock step back
+    sink = shadow.Sink(tmp_path / "s.jsonl", clock=lambda: t.pop(0))
+    for k in ("k1", "k2", "k3"): sink.record("post_message", k, thread=THREAD, text=f"{k}\nref: {k}")
+    ts = [r["ts"] for r in sink.rows]
+    assert ts[0] == "1700000000.000000" and ts[1] == "1700000000.000001" and ts[2] == "1700000000.000002"
+    assert [ts_key(x) for x in ts] == sorted(ts_key(x) for x in ts)
+    with (tmp_path / "s.jsonl").open("a") as f: f.write('{"kind": "post_mes')  # a torn last line
+    again = shadow.Sink(tmp_path / "s.jsonl", clock=lambda: 1_600_000_000.0)
+    again.record("post_message", "k4", thread=THREAD, text="k4\nref: k4")
+    assert again.rows[-1]["ts"] == "1700000000.000003"  # after the skipped line, still after the last kept row
+
+
+@pytest.mark.parametrize("argv", [
+    ["gh", "api", "-iXPOST", "repos/o/r/issues"], ["gh", "api", "-ifbody=x", "repos/o/r/issues"], ["gh", "api", "-iX", "POST", "repos/o/r/issues"],
+    ["gh", "api", "-XPOST", "repos/o/r/issues"], ["gh", "api", "-ipaginate", "repos/o/r"], ["gh", "api", "graphql", "--input", "q.json"],
+    ["gh", "api", "graphql", "--input=q.json"]])
+def test_clustered_short_flags_and_graphql_input_files_are_writes(argv): assert not shadow.is_read(argv)
+
+
+def test_real_reads_still_pass_after_the_cluster_rule():
+    assert shadow.is_read(["gh", "api", "-XGET", "repos/o/r"]) and shadow.is_read(["gh", "api", "-q", ".x", "repos/o/r"]) and shadow.is_read(["gh", "api", "-i", "repos/o/r"])
+    assert shadow.is_read(["gh", "api", "-H", "Accept: x", "repos/o/r"]) and shadow.is_read(["gh", "api", "-q.x", "repos/o/r"])
+    assert shadow.is_read(["gh", "api", "graphql", "--input", "-"], json.dumps({"query": "query { viewer { login } }"}))
+    assert shadow.is_read(["gh", "api", "graphql", "-f", "query=query { viewer { login } }"])
+
+
+def test_a_corrupt_middle_line_raises_with_its_line_number(tmp_path):
+    path = tmp_path / "s.jsonl"
+    path.write_text('{"kind": "gh", "key": "k1"}\n{"kind": "gh", "ke\n{"kind": "gh", "key": "k3"}\n')
+    with pytest.raises(shadow.SinkCorrupt, match="line 2"): shadow.Sink(path)
+
+
+def test_a_torn_last_line_reopens_with_a_warning(tmp_path, caplog):
+    path = tmp_path / "s.jsonl"
+    path.write_text('{"kind": "gh", "key": "k1"}\n{"kind": "gh", "ke')
+    assert shadow.Sink(path).keys == {"k1"} and "line 2" in caplog.text and "torn" in caplog.text
