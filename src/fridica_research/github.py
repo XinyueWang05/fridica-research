@@ -40,11 +40,19 @@ from .config import Config
 from .machine import ORDER, Event, State
 
 log = logging.getLogger("fridica_research.github")
-PR_FIELDS = "headRefOid,state,mergedAt,mergeCommit,author,milestone,isDraft"  # the PR's own fields; reviews come from REST (`reviews`)
+PR_FIELDS = "headRefOid,state,mergedAt,mergeCommit,author,milestone,isDraft,mergeable,statusCheckRollup"  # the PR's own fields; reviews come from REST (`reviews`)
 POLLED_STAGES = ("Audit", "Deliver", "Delivered")
 VERDICTS = ("APPROVED", "CHANGES_REQUESTED", "DISMISSED")  # a COMMENTED review never supersedes a login's verdict
 Q_PR = "query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){id}}}"
 ACK = "acknowledged, goes into the next PR"
+
+
+class ReviewRequestRefused(RuntimeError):
+    """GitHub answered a review request with HTTP 422 (the login has no access, or is the author): never retried."""
+
+    def __init__(self, pr: str, logins: list[str], detail: str):
+        super().__init__(f"review request for {', '.join(logins)} on {pr} refused (HTTP 422): {detail}")
+        self.pr, self.logins = pr, list(logins)
 
 
 class PrHygieneError(ValueError):
@@ -110,9 +118,59 @@ def list_prs(run: Runner, repo: str, author: str) -> list[dict]:
     return json.loads(run(["gh", "pr", "list", "-R", repo, "--author", author, "--state", "open", "--json", LIST_FIELDS], None) or "[]")
 
 
+MERGEABLE = ("MERGEABLE", "CONFLICTING", "UNKNOWN")
+CHECK_FAILURE = {"FAILURE", "CANCELLED", "TIMED_OUT", "STARTUP_FAILURE", "ACTION_REQUIRED", "ERROR"}
+CHECK_SUCCESS = {"SUCCESS", "NEUTRAL", "SKIPPED"}
+
+
+def check_state(c: dict) -> str:
+    """One rollup entry as SUCCESS, PENDING or FAILURE: a CheckRun by its conclusion once COMPLETED (else PENDING),
+    a StatusContext by its state; anything unrecognized stays PENDING."""
+    if c.get("__typename") == "StatusContext" or ("state" in c and "status" not in c): s = str(c.get("state") or "").upper()
+    elif str(c.get("status") or "").upper() != "COMPLETED": return "PENDING"
+    else: s = str(c.get("conclusion") or "").upper()
+    return "FAILURE" if s in CHECK_FAILURE else "SUCCESS" if s in CHECK_SUCCESS else "PENDING"
+
+
+def checks_state(rollup: list[dict] | None) -> str:
+    """The PR's CI as one word: FAILURE wins over PENDING, which wins over SUCCESS; NONE when there are no checks."""
+    states = {check_state(c) for c in rollup or []}
+    return next((s for s in ("FAILURE", "PENDING", "SUCCESS") if s in states), "NONE")
+
+
 def view_pr(run: Runner, pr: str) -> dict:
+    """The PR's fields, with `mergeable` normalized to MERGEABLE/CONFLICTING/UNKNOWN and the raw `statusCheckRollup`
+    replaced by `checks` (`checks_state`)."""
     repo, n = contracts.pr_id(pr)
-    return json.loads(run(["gh", "pr", "view", n, "-R", repo, "--json", PR_FIELDS], None))
+    v = json.loads(run(["gh", "pr", "view", n, "-R", repo, "--json", PR_FIELDS], None))
+    m = str(v.get("mergeable") or "").upper()
+    v["mergeable"] = m if m in MERGEABLE else "UNKNOWN"
+    v["checks"] = checks_state(v.pop("statusCheckRollup", None))
+    return v
+
+
+def request_reviewers(run: Runner, pr: str, logins: list[str]):
+    """Request reviews through REST; a 422 raises `ReviewRequestRefused`, any other failure propagates as is."""
+    repo, n = contracts.pr_id(pr)
+    try: run(["gh", "api", "-X", "POST", f"repos/{repo}/pulls/{n}/requested_reviewers", "--input", "-"], json.dumps({"reviewers": logins}))
+    except Exception as e:
+        if "HTTP 422" in str(e): raise ReviewRequestRefused(pr, logins, str(e)) from e
+        raise
+
+
+ISSUE_FIELDS = "number,url,title,body,state,isDraft,author,headRefOid,mergedAt"
+
+
+def references(text: str, issue: int) -> bool:
+    """`text` names `#<issue>` itself: not `#<issue>5`, not `other/repo#<issue>`, not `abc#<issue>`."""
+    return re.search(rf"(?<![\w/#])#{issue}(?!\d)", text or "") is not None
+
+
+def list_prs_for_issue(run: Runner, repo: str, issue: int | str) -> list[dict]:
+    """The PRs of `repo` in every state (open, closed, merged) whose title or body references `#<issue>`."""
+    n = int(str(issue).lstrip("#"))
+    prs = json.loads(run(["gh", "pr", "list", "-R", repo, "--state", "all", "--search", f"#{n}", "--limit", "200", "--json", ISSUE_FIELDS], None) or "[]")
+    return [p for p in prs if references(p.get("title", ""), n) or references(p.get("body", ""), n)]
 
 
 def pr_reviews(run: Runner, pr: str) -> list[dict]:
@@ -146,20 +204,18 @@ class GitHub:
         login = str(a.get("login", "")).lower()
         return bool(a.get("is_bot")) or a.get("type") == "Bot" or login.endswith("[bot]") or login in {b.lower() for b in self.g.bots}
 
-    def request_reviews(self, pr: str, logins: list[str]):
-        repo, n = contracts.pr_id(pr)
-        self.api("POST", f"repos/{repo}/pulls/{n}/requested_reviewers", {"reviewers": logins})
+    def request_reviews(self, pr: str, logins: list[str]): request_reviewers(self.run, pr, logins)
 
     def request_each(self, pr: str, logins: list[str], done: list[str], refused: list[str]):
         """L4: one request per login; a login GitHub refuses (HTTP 422: no access) goes to `refused` and is never retried."""
         for lg in logins:
             if lg in done or lg in refused: continue
             try: self.request_reviews(pr, [lg])
-            except Exception as e:  # noqa: BLE001 - other failures are retried on the next poll
-                if "HTTP 422" not in str(e):
-                    log.warning("review request for %s on %s failed: %s", lg, pr, e)
-                    continue
+            except ReviewRequestRefused:
                 refused.append(lg)
+                continue
+            except Exception as e:  # noqa: BLE001 - other failures are retried on the next poll
+                log.warning("review request for %s on %s failed: %s", lg, pr, e)
                 continue
             done.append(lg)
 
