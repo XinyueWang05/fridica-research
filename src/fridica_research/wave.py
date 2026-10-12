@@ -32,6 +32,11 @@ registered Innie. The deputy's edits are pure functions on a wave: `drop_job` (a
 `add_job` (the opening checks again), `bind_pr` and `set_eta`. A job's first ETAs stay on `Job.first_etas`
 and `close()` scores against them; the wave closes when every job is merged or dropped, and the dropped
 jobs are listed apart, never scored. Skipping the polls of a dropped job and the ledger row are driver work.
+
+#89, #90, #92 (wave G): a job's round carries the floor manager's ETAs as `Round.etas` (Implement -> `pr_eta`,
+CodeAudit -> `review_eta`) and takes its due times from them; `set_eta` updates them. `merge_ready` also needs
+`arbiter.unblocked`. An unrouted post that carries a hand-off marker gets one durable reply asking for the job's
+ref line; plain chat stays a finding.
 """
 from __future__ import annotations
 
@@ -242,8 +247,14 @@ def check_disjoint(jobs: list[Job]):
 def new_round(thread: str, n: int, j: Job, now: float, cfg: Config) -> arbiter.Round:
     """The job's `arbiter.Round` on the short track, keyed `<thread>:jobN`. No `arbiter.adopt`: that is one issue per thread."""
     roster = {role: {"holders": [j.person(role)["slack"]], "login": j.person(role)["login"], "delegate": False} for role in ROLES}
+    etas = round_etas(j)
     return arbiter.Round(thread=job_thread(thread, n), channel=thread.split(":")[1], issue=int(j.issue), repo=j.repo, stage=JOB_ORDER[0],
-                         stage_started=now, adopted_at=now, due=now + arbiter.budget(cfg, JOB_ORDER[0]), order=list(JOB_ORDER), roster=roster)
+                         stage_started=now, adopted_at=now, due=etas.get(JOB_ORDER[0]), order=list(JOB_ORDER), roster=roster, etas=etas)
+
+
+def round_etas(j: Job) -> dict[str, float]:
+    """The job's ETAs as the round's due times (#89): `pr_eta` for Implement, `review_eta` for CodeAudit."""
+    return {stage: float(t) for stage, t in (("Implement", j.pr_eta), ("CodeAudit", j.review_eta)) if t is not None}
 
 
 def open_wave(thread: str, *, name: str, repo: str, jobs: list[dict], now: float, cfg: Config) -> Wave:
@@ -296,6 +307,8 @@ def set_eta(wave: Wave, n: int, *, pr_eta=None, review_eta=None) -> Wave:
     j.first_etas = {name: j.first_eta(name) for name in ETAS}
     if pr_eta is not None: j.pr_eta = parse_time(pr_eta)
     if review_eta is not None: j.review_eta = parse_time(review_eta)
+    j.round["etas"] = round_etas(j)  # the round's due follows the re-estimate (#89)
+    if j.round.get("stage") in j.round["etas"]: j.round["due"] = j.round["etas"][j.round["stage"]]
     return w
 
 
@@ -340,9 +353,23 @@ def route(w: Wave, ev: Event) -> tuple[Job | None, str]:
     return None, (f"{sender} holds a role in jobs " + ", ".join(str(w.number(j)) for j in held)) if held else f"{sender} holds no role and the post names no job"
 
 
+def unrouted(w: Wave, ev: Event, ts: str) -> list[Action]:
+    """#92: an unrouted post that carries a hand-off marker gets one durable reply asking for the job's ref line; plain chat stays a finding."""
+    text, sender = str(ev.get("text") or ""), str(ev.get("sender") or "")
+    if ev.kind != "crew_post" or not ts or not arbiter.HANDOFF_MARK.search(text): return []
+    ref = f"{w.thread}/wave/unrouted/{ts}"
+    if any(p.get("id") == ref for p in w.pending): return []
+    jobs = ", ".join(f"`ref: fm-wave-{w.name or '<w>'}-job{n}` (#{j.issue})" for n, j in enumerate(w.jobs, 1) if not j.terminal)
+    a = Action("post", ref, {"thread": w.thread, "post_kind": "report", "text": "\n".join([
+        f"<@{sender}> this hand-off names no single job, so it did not clear anything. Post it again with the job's line: {jobs}.", f"ref: {ref}"])})
+    w.pending = w.pending + [a.to_dict()]
+    return [a]
+
+
 def merge_ready(j: Job) -> bool:
+    """In Merge or approved on the current head, and `unblocked` (#90): not conflicting, checks green or none, not draft."""
     r = j.rnd()
-    return r.stage == "Merge" or arbiter.approved(r)
+    return (r.stage == "Merge" or arbiter.approved(r)) and arbiter.unblocked(r)
 
 
 def rewrite(w: Wave, a: Action) -> Action:
@@ -363,7 +390,7 @@ def observe(wave: Wave, ev: Event, cfg: Config) -> tuple[Wave, list[Action]]:
     j, why = route(w, ev)
     if j is None:
         w.findings.append(f"{ev.kind} {ts or ''}".rstrip() + f" not routed: {why}")
-        return w, []
+        return w, unrouted(w, ev, ts)
     n = w.number(j)
     if ev.kind == "merged":
         recorded = int((j.round.get("pr") or {}).get("number") or 0)

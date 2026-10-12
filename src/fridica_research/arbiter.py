@@ -38,6 +38,12 @@ Slice 3 carries: a PR closed without merging is dropped with a finding and no st
 re-adopts; `adopt` raises a `RosterError` for a register error (`RegisterRosterError` is both). The ETA ladder
 is `ladder.step`, a separate pure module.
 
+Wave G (#89, #90, #92), for a wave job's round (one with `etas`): due times are the floor manager's ETAs, never the crew
+budget, and a hand-off needs no due line; a blocking finding (off-role or linkless hand-off, held hand-off, PR closed
+unmerged) is also one durable post to its author. "ready to merge" waits until the PR is `unblocked`; a head move in
+Merge that the auditor has not approved sends the round back to CodeAudit with its old ETA. An adopted round keeps
+the crew budget, silent findings and its ready post on entering Merge.
+
 Out of this slice: merge and the queue, per-role AI opt-in execution.
 """
 from __future__ import annotations
@@ -119,6 +125,20 @@ def budget(cfg: Config, stage: str) -> float:
     return float(cfg.crew_budget.get(BUDGET_KEY.get(stage, ""), cfg.stage_timeout))
 
 
+def due_for(r: "Round", stage: str, now: float, cfg: Config) -> float | None:
+    """A wave job's due time is the floor manager's ETA for the stage (#89, R49), or the round's current one for a stage with no ETA
+    (Merge keeps the review ETA); an adopted round, with no `etas`, rebases on the crew budget."""
+    if r.etas: return r.etas.get(stage, r.due)
+    return now + budget(cfg, stage)
+
+
+def unblocked(r: "Round") -> bool:
+    """#90: the PR can merge as far as the last view knows: not CONFLICTING, checks SUCCESS or NONE, not draft. A view without
+    `mergeable` or `checks` does not block."""
+    pr = r.pr or {}
+    return str(pr.get("mergeable") or "").upper() != "CONFLICTING" and str(pr.get("checks") or "NONE").upper() in ("SUCCESS", "NONE") and not pr.get("draft")
+
+
 def next_stage(rnd: "Round", stage: str) -> str | None:
     order = tuple(rnd.order) or ORDER
     i = order.index(stage) if stage in order else -1
@@ -146,6 +166,7 @@ class Round:
     pending: list[dict] = field(default_factory=list)  # durable actions the daemon has not taken yet; cleared only on a successful send
     pr: dict = field(default_factory=dict)  # slice 2: {number, head, state, draft, review, changes_requested, signoffs}
     held: dict[str, dict] = field(default_factory=dict)  # stage -> {ts, sender, text}: a hand-off held until its PR condition is met
+    etas: dict[str, float] = field(default_factory=dict)  # stage -> the floor manager's ETA (#89): a wave job's round; an adopted round has none
 
     def holders(self, role: str) -> list[str]: return list((self.roster.get(role) or {}).get("holders") or [])
     def login(self, role: str, cfg: Config | None = None) -> str:
@@ -263,22 +284,31 @@ def observe(rnd: Round, ev: Event, cfg: Config) -> tuple[Round, list[Action]]:
     if nxt is None: return r, []  # the merge stage closes the round; merging is a later slice
     role = ROUND_ROLE[stage]
     if sender not in r.holders(role):
-        r.findings.append(f"{stage}: hand-off from {sender}, who does not hold {role}; stage not cleared")
-        return r, []  # the off-role reminder is a later slice
+        return r, blocking(r, f"{stage}: hand-off from {sender}, who does not hold {role}; stage not cleared", ts, sender)
     if not LINK.search(text):
-        r.findings.append(f"{stage}: hand-off from {sender} carries no link; stage not cleared")
-        return r, []
-    if not DUE.search(text):
+        return r, blocking(r, f"{stage}: hand-off from {sender} carries no link; stage not cleared", ts, sender)
+    if not r.etas and not DUE.search(text):  # a wave job's due time is the floor manager's ETA (#89): its hand-off needs no due line
         r.findings.append(f"{stage}: hand-off from {sender} carries no due time (expected `Due MM-DD HH:MM ET`); stage not cleared")
         return r, []
     why = hold_reason(r, stage)
-    if why:  # held silently: replayed by the PR poll that meets the condition
-        r.findings.append(f"{stage}: hand-off from {sender} held: {why}")
+    if why:  # held: replayed by the PR poll that meets the condition
         r.held[stage] = {"ts": ts, "sender": sender, "text": text}
-        return r, []
+        return r, blocking(r, f"{stage}: hand-off from {sender} held: {why}", ts, sender)
     actions = clear(r, stage, sender, text, ts, ev.now, cfg)
     r.pending = r.pending + [a.to_dict() for a in actions if a.kind in DURABLE]
     return r, actions
+
+
+def blocking(r: Round, finding: str, key: str, to: str) -> list[Action]:
+    """A blocking finding (#92). A wave job's round (one with `etas`) also posts it once, to `to`, as a durable reply keyed by `key`;
+    an adopted round keeps it as a finding only."""
+    r.findings.append(finding)
+    ref = f"{r.thread}/round/block/{key}"
+    if not r.etas or not key or ref in r.posted_refs: return []
+    r.posted_refs.append(ref)
+    a = Action("post", ref, {"thread": r.thread, "post_kind": "report", "text": "\n".join([f"<@{to}> {finding}." if to else f"{finding}.", f"ref: {ref}"])})
+    r.pending = r.pending + [a.to_dict()]
+    return [a]
 
 
 def clear(r: Round, stage: str, sender: str, text: str, ts: str, now: float, cfg: Config) -> list[Action]:
@@ -290,7 +320,7 @@ def clear(r: Round, stage: str, sender: str, text: str, ts: str, now: float, cfg
     mentioned = set(MENTION.findall(text))
     next_holders = r.holders(nrole)
     has_mention = bool(mentioned & set(next_holders))
-    rebased = now + budget(cfg, nxt)
+    rebased = due_for(r, nxt, now, cfg)
     if nxt == "Merge":
         pass  # nobody is handed Merge: the auditor stays assignee and `move` posts "ready to merge" (#87)
     elif not has_mention and not next_holders:
@@ -305,7 +335,7 @@ def clear(r: Round, stage: str, sender: str, text: str, ts: str, now: float, cfg
             r.posted_refs.append(ref)
             actions.append(Action("post", ref, {"thread": r.thread, "post_kind": "report", "text": mention_fix_text(r, stage, nxt, sender, link.group(0), rebased, ref)}))
 
-    r.clearance[stage] = {"handoff_ts": ts, "author": sender, "link": link.group(0), "due_text": due.group("when"), "mention": has_mention}
+    r.clearance[stage] = {"handoff_ts": ts, "author": sender, "link": link.group(0), "due_text": due.group("when") if due else "", "mention": has_mention}
     r.held.pop(stage, None)
     actions += move(r, stage, nxt, now, ts, cfg)
     return actions
@@ -313,16 +343,21 @@ def clear(r: Round, stage: str, sender: str, text: str, ts: str, now: float, cfg
 
 def move(r: Round, stage: str, nxt: str, now: float, key: str, cfg: Config) -> list[Action]:
     """Stage, start and due move at once; the board follows; durable actions go on `pending` before anything is sent (A5)."""
-    r.stage, r.stage_started, r.due = nxt, now, now + budget(cfg, nxt)
+    r.stage, r.stage_started, r.due = nxt, now, due_for(r, nxt, now, cfg)
     board = board_action(r, stage, nxt, ROUND_ROLE[nxt], key, cfg)
     actions = [board] if board is not None else []
-    if nxt == "Merge" and r.pr.get("number"):  # once per head: a new head after a bounce posts again
-        ref = f"{r.thread}/round/merge/{r.pr['number']}/{r.pr.get('head', '')}"
-        if ref not in r.posted_refs:
-            r.posted_refs.append(ref)
-            actions.insert(0, Action("post", ref, {"thread": r.thread, "post_kind": "report", "text": "\n".join([
-                f"PR #{r.pr['number']} is approved on {str(r.pr.get('head', ''))[:12]}: ready to merge.", f"ref: {ref}"])}))
-    return actions
+    return ready_post(r) + actions
+
+
+def ready_post(r: Round) -> list[Action]:
+    """"ready to merge", once per head, in Merge. A wave job's round (one with `etas`) posts only while the PR is `unblocked` (#90), and a held
+    post goes out on the poll that unblocks it; an adopted round, which the driver does not poll in Merge, posts on entering Merge."""
+    if r.stage != "Merge" or not r.pr.get("number") or (r.etas and not unblocked(r)): return []
+    ref = f"{r.thread}/round/merge/{r.pr['number']}/{r.pr.get('head', '')}"
+    if ref in r.posted_refs: return []
+    r.posted_refs.append(ref)
+    return [Action("post", ref, {"thread": r.thread, "post_kind": "report", "text": "\n".join([
+        f"PR #{r.pr['number']} is approved on {str(r.pr.get('head', ''))[:12]}: ready to merge.", f"ref: {ref}"])})]
 
 
 def polled(r: Round, ev: Event, cfg: Config) -> tuple[Round, list[Action]]:
@@ -332,14 +367,20 @@ def polled(r: Round, ev: Event, cfg: Config) -> tuple[Round, list[Action]]:
         p = pick_pr(r, ev.get("prs") or [], cfg)
         if p is None: return r, []
         r.pr.update({"number": int(p["number"]), "head": p.get("headRefOid", ""), "state": p.get("state", "OPEN"), "draft": bool(p.get("isDraft"))})
+    moved = False
     if ev.get("view"):
         v = ev["view"]
+        moved = bool(r.pr.get("head")) and v.get("headRefOid", r.pr["head"]) != r.pr["head"]
         r.pr.update({"head": v.get("headRefOid", r.pr.get("head", "")), "state": v.get("state", r.pr.get("state", "")), "draft": bool(v.get("isDraft", r.pr.get("draft")))})
+        for k, bad in (("mergeable", ("CONFLICTING",)), ("checks", ("FAILURE", "PENDING"))):  # #90: a view without the field does not block
+            if k in v: r.pr[k] = v[k]
+            elif str(r.pr.get(k) or "").upper() in bad: r.pr.pop(k)
         if str(v.get("state", "")).upper() == "CLOSED" and not v.get("mergedAt"):
             # closed without merging: drop it, keep the stage, and let the next poll adopt the implementer's next open PR
-            r.findings.append(f"{r.stage}: PR #{r.pr['number']} was closed without merging; dropped, stage not moved")
+            n = r.pr["number"]
             r.pr = {}
-            return r, []
+            actions = blocking(r, f"{r.stage}: PR #{n} was closed without merging; dropped, stage not moved", f"closed/{n}", (r.holders("implementer") or [""])[0])
+            return r, actions
     if ev.get("reviews") is not None:
         auditors = {r.login("auditor", cfg).lower()} - {""}
         verdicts = [v for k, v in latest_verdicts(ev["reviews"]).items() if k in auditors]
@@ -372,6 +413,17 @@ def polled(r: Round, ev: Event, cfg: Config) -> tuple[Round, list[Action]]:
     elif r.stage == "Implement" and "Implement" in r.held and r.pr.get("number"):
         h = r.held["Implement"]
         actions += clear(r, "Implement", h["sender"], h["text"], h["ts"], ev.now, cfg)
+    elif r.stage == "Merge" and moved and not approved(r) and "CodeAudit" in r.order:
+        # #90: a push past the approval sends the round back to the auditor; the due time is the CodeAudit ETA it had
+        actions += move(r, "Merge", "CodeAudit", ev.now, f"head-{head}", cfg)
+        ref = f"{r.thread}/round/stale/{r.pr['number']}/{head}"
+        if ref not in r.posted_refs:
+            r.posted_refs.append(ref)
+            who = " ".join(f"<@{h}>" for h in r.holders("auditor")) or "(holder unset)"
+            actions.insert(0, Action("post", ref, {"thread": r.thread, "post_kind": "report", "text": "\n".join([
+                f"{who} PR #{r.pr['number']} moved to {str(head)[:12]} after the approval; the round is back in CodeAudit for a review of the new head.", f"ref: {ref}"])}))
+    elif r.stage == "Merge":
+        actions += ready_post(r)
     r.pending = r.pending + [a.to_dict() for a in actions if a.kind in DURABLE]
     return r, actions
 
