@@ -1,4 +1,5 @@
-"""`fridica-research start | adopt | list | stop | resume | note | pr | serve | replay | score | wave` (argparse, stdlib only)."""
+"""`fridica-research start | adopt | list | stop | resume | note | pr | serve | replay | score | wave` (argparse, stdlib only).
+`wave` has open, status [--json], drop, add-job, bind-pr and eta."""
 from __future__ import annotations
 
 import argparse
@@ -79,8 +80,17 @@ def cmd_list(cfg: config.Config, args) -> int:
         r = arbiter.Round.from_json(store.get_meta(arbiter.round_key(thread)) or "{}")
         holders = ", ".join(f"{role}={'+'.join(e.get('holders') or [])}" for role, e in sorted(r.roster.items()))
         print(f"{r.thread}\tround {r.stage}/{arbiter.ROUND_ROLE.get(r.stage, '?')}\t{arbiter.due_line(r.due)}\tissue {r.issue or '-'}\t{holders}")
+    for thread, w in waves(store):
+        print(f"{thread}\twave {w.name or '-'}\t{'closed ' + arbiter.et_time(w.closed_at) if w.closed_at else 'open'}\t{sum(j.merged for j in w.jobs)}/{len(w.jobs)} merged, "
+              f"{sum(j.dropped for j in w.jobs)} dropped\t{len(w.findings)} findings")
     store.close()
     return 0
+
+
+def waves(store: Store) -> list[tuple[str, wave.Wave]]:
+    """Every `wave:<thread>` key, open or closed, with its wave."""
+    rows = store.db.execute("SELECT key, value FROM meta WHERE key LIKE 'wave:%' ORDER BY key").fetchall()
+    return [(k.split(":", 1)[1], wave.Wave.from_json(v)) for k, v in rows]
 
 
 def cmd_command(cfg: config.Config, args, cmd: str) -> int:
@@ -97,6 +107,12 @@ def cmd_command(cfg: config.Config, args, cmd: str) -> int:
 def cmd_serve(cfg: config.Config, args) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
     store = Store(cfg.state_file)
+    if not (cfg.github.enabled or cfg.board.enabled):  # #86: an open wave is fed only by GitHub polls; without them it never closes
+        stuck = [t for t, w in waves(store) if w.closed_at is None]
+        if stuck:
+            print(f"open wave(s) {', '.join(stuck)} but [github] and [board] are both off: no PR or merge would ever be seen; enable [github] or close the wave", file=sys.stderr)
+            store.close()
+            return 1
     board = Board(cfg, remember=store.set_meta, recall=store.get_meta) if cfg.board.enabled else None
     github = GitHub(cfg, remember=store.set_meta, recall=store.get_meta) if cfg.github.enabled else None
     Driver(cfg, build_client(cfg), store, llm=claude_runner(cfg.llm_model), board=board, github=github).serve(once=args.once)
@@ -128,22 +144,43 @@ def cmd_pr(cfg: config.Config, args) -> int:
 
 
 def cmd_wave(cfg: config.Config, args) -> int:
-    """#69 part a: `wave open <thread> --job …` records a wave and its jobs (the floor manager's ETAs, never computed); `wave status <thread>` prints it. Driver wiring is slice 3."""
+    """#69 part a: `wave open <thread> --job …` records a wave and its jobs (the floor manager's ETAs, never computed); `wave status <thread>` prints it.
+    #93: `wave drop|add-job|bind-pr|eta` edit the stored wave; a drop that closes it leaves the close post on `pending` for the driver to send."""
     store = Store(cfg.state_file)
     try:
         key = wave.wave_key(args.thread)
-        if args.wave_cmd == "status":
+        if args.wave_cmd != "open":
             raw = store.get_meta(key)
             if raw is None:
                 print(f"{args.thread} is not an open wave", file=sys.stderr)
                 return 1
-            for line in wave.status_lines(wave.Wave.from_json(raw)): print(line)
+            w = wave.Wave.from_json(raw)
+            if args.wave_cmd == "status":
+                if args.json: print(json.dumps(w.to_dict(), sort_keys=True, indent=2))
+                else:
+                    for line in wave.status_lines(w): print(line)
+                return 0
+            now = time.time()
+            try:
+                if args.wave_cmd == "drop": w, _ = wave.drop_job(w, args.job, args.reason, now=now)
+                elif args.wave_cmd == "add-job": w = wave.add_job(w, wave.parse_job(args.job), now=now, cfg=cfg)
+                elif args.wave_cmd == "bind-pr": w = wave.bind_pr(w, args.job, args.pr, head=args.head, now=now)
+                else: w = wave.set_eta(w, args.job, pr_eta=args.pr_eta, review_eta=args.review_eta)
+            except (wave.WaveError, ValueError) as e:
+                print(str(e), file=sys.stderr)
+                return 1
+            store.set_meta(key, w.to_json())
+            print(f"wave {w.name or '-'}: {args.wave_cmd} recorded" + ("; closed, the close post waits for the serving driver" if w.closed_at else ""))
+            for line in wave.status_lines(w): print(line)
             return 0
         if store.load(args.thread) is not None or store.get_meta(arbiter.round_key(args.thread)) is not None:
             print(f"{args.thread} is an AI study or an adopted round; wave open is for a wave thread", file=sys.stderr)
             return 1
         if store.get_meta(key) is not None:
             print(f"{args.thread} is already an open wave", file=sys.stderr)
+            return 1
+        if not str(args.repo or "").strip():
+            print("wave open needs --repo owner/name: without it no PR or merge of the wave is ever polled (#86)", file=sys.stderr)
             return 1
         try:
             w = wave.open_wave(args.thread, name=args.name, repo=args.repo, jobs=[wave.parse_job(j) for j in args.job], now=time.time(), cfg=cfg)
@@ -210,11 +247,29 @@ def parser() -> argparse.ArgumentParser:
     wo = wsub.add_parser("open", help="record a wave and its jobs; the ETAs and assignments are the floor manager's (R49) and are recorded, never computed")
     wo.add_argument("thread", help="the wave thread id, workspace:channel:root_ts")
     wo.add_argument("--name", default="", help="the <w> of the thread's `ref: fm-wave-<w>-jobN` lines (e.g. d)")
-    wo.add_argument("--repo", default="", help="owner/name of the jobs' issues and PRs")
+    wo.add_argument("--repo", default="", help="owner/name of the jobs' issues and PRs (required: an empty repo is refused)")
     wo.add_argument("--job", action="append", default=[], required=True,
                     help="issue=N;files=a.py,b/;implementer=U…:login;auditor=U…:login;pr_eta=2026-10-12T02:20Z;review_eta=…[;input_at=…][;config_change=yes] (repeatable, one per job)")
     ws = wsub.add_parser("status", help="print the wave's jobs: stage, PR, ETAs, people, findings")
     ws.add_argument("thread")
+    ws.add_argument("--json", action="store_true", help="the whole stored wave as JSON")
+    wd = wsub.add_parser("drop", help="drop a job with a reason; terminal, and the wave closes when every job is merged or dropped")
+    wd.add_argument("thread")
+    wd.add_argument("job", type=int, help="the job number N of fm-wave-<w>-jobN")
+    wd.add_argument("--reason", required=True)
+    wa = wsub.add_parser("add-job", help="add one job under the opening's checks (ETAs, people, register, disjoint files, one Config job)")
+    wa.add_argument("thread")
+    wa.add_argument("--job", required=True, help="the same spec as wave open --job")
+    wb = wsub.add_parser("bind-pr", help="record a job's PR by hand")
+    wb.add_argument("thread")
+    wb.add_argument("job", type=int)
+    wb.add_argument("--pr", type=int, required=True)
+    wb.add_argument("--head", default="", help="the PR's head sha, when known")
+    we = wsub.add_parser("eta", help="re-estimate a job's ETAs; the first ETAs are kept and scored at close (R49)")
+    we.add_argument("thread")
+    we.add_argument("job", type=int)
+    we.add_argument("--pr-eta", default=None, help="ISO 8601 or epoch seconds")
+    we.add_argument("--review-eta", default=None)
     return p
 
 
