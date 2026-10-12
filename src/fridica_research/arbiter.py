@@ -42,7 +42,7 @@ Wave G (#89, #90, #92), for a wave job's round (one with `etas`): due times are 
 budget, and a hand-off needs no due line; a blocking finding (off-role or linkless hand-off, held hand-off, PR closed
 unmerged) is also one durable post to its author. "ready to merge" waits until the PR is `unblocked`; a head move in
 Merge that the auditor has not approved sends the round back to CodeAudit with its old ETA. An adopted round keeps
-the crew budget and silent findings.
+the crew budget, silent findings and its ready post on entering Merge.
 
 Out of this slice: merge and the queue, per-role AI opt-in execution.
 """
@@ -350,8 +350,9 @@ def move(r: Round, stage: str, nxt: str, now: float, key: str, cfg: Config) -> l
 
 
 def ready_post(r: Round) -> list[Action]:
-    """"ready to merge", once per head, in Merge and only while the PR is `unblocked` (#90): a held post goes out on the poll that unblocks it."""
-    if r.stage != "Merge" or not r.pr.get("number") or not unblocked(r): return []
+    """"ready to merge", once per head, in Merge. A wave job's round (one with `etas`) posts only while the PR is `unblocked` (#90), and a held
+    post goes out on the poll that unblocks it; an adopted round, which the driver does not poll in Merge, posts on entering Merge."""
+    if r.stage != "Merge" or not r.pr.get("number") or (r.etas and not unblocked(r)): return []
     ref = f"{r.thread}/round/merge/{r.pr['number']}/{r.pr.get('head', '')}"
     if ref in r.posted_refs: return []
     r.posted_refs.append(ref)

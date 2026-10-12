@@ -15,6 +15,7 @@ IMP, AUD = "UIMP", "UAUD"
 HEAD, NEW = "a" * 40, "b" * 40
 T0 = 1_791_800_000.0
 CFG = config.Config()
+ETAS = {"Implement": T0 - 3600, "CodeAudit": T0 + 7200}  # a wave job's round: its ready post is gated on `unblocked`
 
 
 def rnd(stage: str, etas: dict | None = None) -> arbiter.Round:
@@ -45,7 +46,7 @@ def test_unblocked(view, ok):
 
 @pytest.mark.parametrize("view", [{"mergeable": "CONFLICTING"}, {"checks": "FAILURE"}, {"checks": "PENDING"}, {"isDraft": True}])
 def test_ready_to_merge_is_held_while_blocked_and_sent_once_unblocked(view):
-    r, a1 = poll(rnd("CodeAudit"), [rv(1, "APPROVED", HEAD)], **view)
+    r, a1 = poll(rnd("CodeAudit", etas=ETAS), [rv(1, "APPROVED", HEAD)], **view)
     assert r.stage == "Merge" and ready(a1) == []
     r, a2 = poll(r, [rv(1, "APPROVED", HEAD)], now=T0 + 60, **view)
     assert ready(a2) == []
@@ -56,9 +57,21 @@ def test_ready_to_merge_is_held_while_blocked_and_sent_once_unblocked(view):
 
 
 def test_a_view_without_the_fields_clears_an_earlier_block():
-    r, _ = poll(rnd("CodeAudit"), [rv(1, "APPROVED", HEAD)], mergeable="CONFLICTING", checks="FAILURE")
+    r, _ = poll(rnd("CodeAudit", etas=ETAS), [rv(1, "APPROVED", HEAD)], mergeable="CONFLICTING", checks="FAILURE")
     r, a = poll(r, [rv(1, "APPROVED", HEAD)], now=T0 + 60)
     assert arbiter.unblocked(r) and len(ready(a)) == 1
+
+
+@pytest.mark.parametrize("view", [{"mergeable": "CONFLICTING"}, {"checks": "FAILURE"}, {"isDraft": True}])
+def test_a_blocked_adopted_round_entering_merge_gets_its_ready_post_at_once(view):
+    # an adopted round (no `etas`) is polled only in Implement and CodeAudit, so its post goes out on entering Merge, as on main
+    r, a1 = poll(rnd("CodeAudit"), [rv(1, "APPROVED", HEAD)], **view)
+    assert r.stage == "Merge" and len(ready(a1)) == 1 and HEAD[:12] in ready(a1)[0]
+    assert any(p["kind"] == "post" and "ready to merge" in p["text"] for p in r.pending)
+    r, a2 = poll(r, [rv(1, "APPROVED", HEAD)], now=T0 + 60, **view)
+    assert ready(a2) == []  # once per head, also after a restart reloads the round
+    r2 = arbiter.Round.from_json(r.to_json())
+    assert ready(arbiter.move(r2, "CodeAudit", "Merge", T0 + 120, "k", CFG)) == []
 
 
 def test_a_view_without_mergeable_or_checks_posts_at_once():
