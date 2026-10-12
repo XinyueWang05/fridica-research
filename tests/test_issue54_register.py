@@ -57,6 +57,19 @@ def test_register_parses_required_and_optional_fields():
     assert register.window("09:00-17:30", "x") == (540, 1050)
 
 
+def test_register_accepts_an_innie_with_only_the_three_required_fields():
+    """Review 5486239541 on #74: `limits` is optional, so a table with only outie, slack and github is accepted."""
+    r = register.parse('[innie.minimal]\noutie = "M"\nslack = "U0MIN"\ngithub = "minimal-gh"\n')
+    m = r.get("minimal")
+    assert (m.outie, m.slack, m.github, m.limits, m.slots, m.hours, m.offline) == ("M", "U0MIN", "minimal-gh", (), 1, "", "")
+    assert register.parse('[innie.a]\noutie = "A"\nslack = "U0A"\ngithub = "a"\nlimits = []\n').get("a").limits == ()  # the same as no limits
+    assert arbiter.parse_roster(["implementer=U0MIN"], ["implementer=minimal-gh"], [], "UOWNER", r)["implementer"]["login"] == "minimal-gh"
+    # no limits says nothing about usage: the quota rules come from the workload report alone
+    e = estimate(NOW, "minimal", workload=WorkloadReport(innie="minimal", reported_at=NOW, session_usage=95.0, session_reset=NOW + timedelta(hours=1)), trial=TrialRun(hours=1.0))
+    assert e.cause == "quota" and e.input_at == NOW + timedelta(hours=1) and not e.capped
+    assert estimate(NOW, "minimal", workload=WorkloadReport(innie="minimal", reported_at=NOW), trial=TrialRun(hours=1.0)).cause == ""
+
+
 @pytest.mark.parametrize("missing", ["outie", "slack", "github"])
 def test_register_rejects_a_missing_required_field(missing):
     text = re.sub(rf"^{missing} = .*\n", "", TOML, count=1, flags=re.M)

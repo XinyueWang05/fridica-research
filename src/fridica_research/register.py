@@ -103,7 +103,7 @@ def _innie(name: str, raw) -> Innie:
     if isinstance(slots, bool) or not isinstance(slots, int) or slots < 1: raise RegisterError(f"[innie.{name}].slots must be an integer >= 1, got {slots!r}")
     for k in ("hours", "offline"):
         if raw.get(k): window(raw[k], f"[innie.{name}].{k}")
-    limits = raw.get("limits", ())
+    limits = raw.get("limits", [])  # optional: absent is the same as an empty list (review 5486239541 on #74)
     if isinstance(limits, str): limits = (limits,) if limits.strip() else ()
     elif isinstance(limits, list) and all(isinstance(x, str) for x in limits): limits = tuple(limits)
     else: raise RegisterError(f"[innie.{name}].limits must be a string or a list of strings")
