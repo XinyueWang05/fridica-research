@@ -26,6 +26,12 @@ Part b (driver wiring and nits): paths go through `posixpath.normpath` with a tr
 name covers what is under it; a suffixed ref (`fm-wave-d-job1-pr`) routes to its job; a merged job's round
 never moves again; a `merged` event naming another PR than the job's is a finding and otherwise ignored; an
 empty wave repo matches no link; two jobs on one issue and an empty path are refused at opening.
+
+#86 and part of #93 (wave F): with `Config.register` set, each person's Slack id and login must be one
+registered Innie. The deputy's edits are pure functions on a wave: `drop_job` (a reason, terminal),
+`add_job` (the opening checks again), `bind_pr` and `set_eta`. A job's first ETAs stay on `Job.first_etas`
+and `close()` scores against them; the wave closes when every job is merged or dropped, and the dropped
+jobs are listed apart, never scored. Skipping the polls of a dropped job and the ledger row are driver work.
 """
 from __future__ import annotations
 
@@ -36,7 +42,7 @@ import re
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 
-from . import arbiter, eta
+from . import arbiter, eta, register as register_mod
 from .config import Config
 from .machine import Action, Event
 
@@ -49,7 +55,8 @@ GH_LINK = re.compile(r"https://github\.com/(?P<repo>[\w.-]+/[\w.-]+)/(?P<kind>pu
 
 
 class WaveError(ValueError):
-    """An opening the driver must refuse: a missing ETA, overlapping files, two Config jobs, an empty file list, or one person in both roles."""
+    """An opening or edit the driver must refuse: a missing ETA, overlapping files, two Config jobs, an empty file list, one person in both roles,
+    a person the register does not hold, or an edit on a terminal job or a closed wave."""
 
 
 def wave_key(thread: str) -> str: return f"wave:{thread}"
@@ -96,6 +103,9 @@ class Job:
     delivered: dict = field(default_factory=dict)  # {"pr": now, "review": now}: the first time each ETA's target was observed
     merged_at: float | None = None
     merge_sha: str = ""
+    first_etas: dict = field(default_factory=dict)  # {"pr_eta", "review_eta"} as opened (or added); `set_eta` never changes it, `close()` scores it
+    dropped_at: float | None = None
+    drop_reason: str = ""
 
     def rnd(self) -> arbiter.Round: return arbiter.Round.from_dict(self.round)
     def person(self, role: str) -> dict: return dict(getattr(self, role) or {})
@@ -103,6 +113,14 @@ class Job:
 
     @property
     def merged(self) -> bool: return self.merged_at is not None
+
+    @property
+    def dropped(self) -> bool: return self.dropped_at is not None
+
+    @property
+    def terminal(self) -> bool: return self.merged or self.dropped
+
+    def first_eta(self, name: str) -> float | None: return self.first_etas.get(name, getattr(self, name))  # a blob from before #93 has none
 
     def to_dict(self) -> dict: return {k: getattr(self, k) for k in self.__dataclass_fields__}
 
@@ -150,7 +168,7 @@ def parse_job(spec: str) -> dict:
         if not part.strip(): continue
         key, sep, value = part.partition("=")
         key, value = key.strip(), value.strip()
-        if not sep or key not in Job.__dataclass_fields__ or key in ("round", "delivered", "merged_at", "merge_sha"):
+        if not sep or key not in Job.__dataclass_fields__ or key in ("round", "delivered", "merged_at", "merge_sha", "first_etas", "dropped_at", "drop_reason"):
             raise WaveError(f"--job: {part.strip()!r} is not one of issue, files, implementer, auditor, input_at, pr_eta, review_eta, config_change, repo")
         if key == "issue": out[key] = int(value)
         elif key == "files": out[key] = [f.strip() for f in value.split(",") if f.strip()]
@@ -179,6 +197,34 @@ def check_job(n: int, j: Job, owner: str):
         if getattr(j, name) is None: raise WaveError(f"job {n} (#{j.issue}): no {name}; the floor manager's ETA is recorded, never computed (R49)")
 
 
+def check_register(n: int, j: Job, reg: register_mod.Register | None):
+    """#86 (R48): with a register, each person's Slack id and GitHub login belong to one and the same registered Innie."""
+    if reg is None: return
+    for role in ROLES:
+        p = j.person(role)
+        by_slack, by_login = reg.by_slack(p["slack"]), reg.by_login(p["login"])
+        if by_slack is None: raise WaveError(f"job {n} (#{j.issue}): {role} {p['slack']} is not in the register ({reg.path or 'no path'})")
+        if by_login is None: raise WaveError(f"job {n} (#{j.issue}): {role} login {p['login']!r} is not in the register ({reg.path or 'no path'})")
+        if by_slack.name != by_login.name:
+            raise WaveError(f"job {n} (#{j.issue}): {role} {p['slack']} is Innie {by_slack.name!r} but login {p['login']!r} is {by_login.name!r}; both must name the same Innie")
+
+
+def load_register(cfg: Config) -> register_mod.Register | None:
+    try: return register_mod.load_for(cfg)  # a register path that is set but missing raises here
+    except register_mod.RegisterError as e: raise WaveError(str(e)) from e
+
+
+def build_job(n: int, spec: dict, repo: str, now: float, cfg: Config, reg: register_mod.Register | None) -> Job:
+    j = Job.from_dict({**{"repo": repo or ""}, **spec})
+    j.input_at = parse_time(j.input_at) if j.input_at is not None else now
+    j.pr_eta, j.review_eta = parse_time(j.pr_eta), parse_time(j.review_eta)
+    check_job(n, j, cfg.owner)
+    check_register(n, j, reg)
+    j.files = [norm_path(f) for f in j.files]
+    j.first_etas = {name: getattr(j, name) for name in ETAS}
+    return j
+
+
 def check_disjoint(jobs: list[Job]):
     """R53: one job per issue, files across jobs are disjoint (equal or nested paths overlap) and at most one job changes Config."""
     for i, a in enumerate(jobs):
@@ -202,15 +248,62 @@ def open_wave(thread: str, *, name: str, repo: str, jobs: list[dict], now: float
     """The driver opens one wave thread with its N jobs, or refuses. Opening posts nothing and writes no board field."""
     if len(str(thread).split(":")) != 3: raise WaveError(f"{thread!r} is not a thread id (workspace:channel:root_ts)")
     if not jobs: raise WaveError("a wave needs at least one job: --job issue=…;files=…;implementer=…;auditor=…;pr_eta=…;review_eta=…")
-    built = [Job.from_dict({**{"repo": repo or ""}, **j}) for j in jobs]
-    for n, j in enumerate(built, 1):
-        j.input_at = parse_time(j.input_at) if j.input_at is not None else now
-        j.pr_eta, j.review_eta = parse_time(j.pr_eta), parse_time(j.review_eta)
-        check_job(n, j, cfg.owner)
-        j.files = [norm_path(f) for f in j.files]
+    reg = load_register(cfg)
+    built = [build_job(n, j, repo, now, cfg, reg) for n, j in enumerate(jobs, 1)]
     check_disjoint(built)
     for n, j in enumerate(built, 1): j.round = new_round(thread, n, j, now, cfg).to_dict()
     return Wave(thread=thread, name=str(name or ""), channel=str(thread).split(":")[1], repo=repo or "", opened_at=now, jobs=built)
+
+
+# -- the deputy's edits (#93; pure, the CLI saves them) ---------------------------------
+def editable(w: Wave, n: int) -> Job:
+    if w.closed_at is not None: raise WaveError(f"wave {w.name or '-'} is closed")
+    j = w.job(int(n))
+    if j is None: raise WaveError(f"no job {n} in this wave ({len(w.jobs)} jobs)")
+    if j.terminal: raise WaveError(f"job {n} (#{j.issue}) is {'merged' if j.merged else 'dropped'}; a terminal job does not change")
+    return j
+
+
+def add_job(wave: Wave, spec: dict, *, now: float, cfg: Config) -> Wave:
+    """One more job, under the opening's checks: ETAs, people, register, one job per issue, disjoint files, one Config job."""
+    w = copy.deepcopy(wave)
+    if w.closed_at is not None: raise WaveError(f"wave {w.name or '-'} is closed; open a new wave")
+    n = len(w.jobs) + 1
+    j = build_job(n, spec, w.repo, now, cfg, load_register(cfg))
+    check_disjoint(w.jobs + [j])
+    j.round = new_round(w.thread, n, j, now, cfg).to_dict()
+    w.jobs.append(j)
+    return w
+
+
+def bind_pr(wave: Wave, n: int, pr: int, *, head: str = "", now: float) -> Wave:
+    """Record a job's PR by hand (one the poll did not adopt): links to it route to the job, and the PR counts as delivered now."""
+    if int(pr or 0) <= 0: raise WaveError(f"PR number must be positive, got {pr!r}")
+    w = copy.deepcopy(wave)
+    j = editable(w, n)
+    j.round["pr"] = {**(j.round.get("pr") or {}), "number": int(pr), **({"head": head} if head else {})}
+    j.delivered.setdefault("pr", now)
+    return w
+
+
+def set_eta(wave: Wave, n: int, *, pr_eta=None, review_eta=None) -> Wave:
+    """The floor manager's re-estimate: the current ETA changes, `first_etas` stays and is what `close()` scores (R49)."""
+    if pr_eta is None and review_eta is None: raise WaveError("give a new pr_eta, review_eta or both")
+    w = copy.deepcopy(wave)
+    j = editable(w, n)
+    j.first_etas = {name: j.first_eta(name) for name in ETAS}
+    if pr_eta is not None: j.pr_eta = parse_time(pr_eta)
+    if review_eta is not None: j.review_eta = parse_time(review_eta)
+    return w
+
+
+def drop_job(wave: Wave, n: int, reason: str, *, now: float) -> tuple[Wave, list[Action]]:
+    """Drop a job with a reason. Terminal: its round never moves again. The last open job going terminal closes the wave."""
+    if not str(reason or "").strip(): raise WaveError("drop needs a reason")
+    w = copy.deepcopy(wave)
+    j = editable(w, n)
+    j.dropped_at, j.drop_reason = now, str(reason).strip()
+    return w, close(w, now) if all(x.terminal for x in w.jobs) else []
 
 
 # -- routing ----------------------------------------------------------------------------
@@ -276,12 +369,15 @@ def observe(wave: Wave, ev: Event, cfg: Config) -> tuple[Wave, list[Action]]:
             w.findings.append(f"job {n} (#{j.issue}): merged event for PR #{ev['pr']}, but the job's PR is #{recorded}; ignored")
             return w, []
         if j.merged: return w, []
+        if j.dropped:
+            w.findings.append(f"job {n} (#{j.issue}): merged event for PR #{ev.get('pr') or '-'} after the job was dropped; ignored")
+            return w, []
         if not merge_ready(j): w.findings.append(f"job {n} (#{j.issue}): merged on GitHub before it was merge-ready (round at {j.rnd().stage}); the merge is ground truth")
         j.merged_at, j.merge_sha = ev.now, str(ev.get("sha") or "")
         j.round["pr"] = {**(j.round.get("pr") or {}), "state": "MERGED", **({"number": int(ev["pr"])} if ev.get("pr") else {})}
         for k in ("pr", "review"): j.delivered.setdefault(k, ev.now)  # a merged PR was delivered and reviewed by then, at the latest
-        return w, close(w, ev.now) if all(x.merged for x in w.jobs) else []
-    if j.merged: return w, []  # a merged job's round is final: no later post or poll moves it
+        return w, close(w, ev.now) if all(x.terminal for x in w.jobs) else []
+    if j.terminal: return w, []  # a merged or dropped job's round is final: no later post or poll moves it
     r, actions = arbiter.observe(j.rnd(), ev, cfg)
     if r.pr.get("number") and "pr" not in j.delivered: j.delivered["pr"] = ev.now
     if arbiter.approved(r) and "review" not in j.delivered: j.delivered["review"] = ev.now
@@ -291,18 +387,21 @@ def observe(wave: Wave, ev: Event, cfg: Config) -> tuple[Wave, list[Action]]:
 
 
 def close(w: Wave, now: float) -> list[Action]:
-    """Every job merged: one `wave_close` with the (first ETA, delivered) pairs and their `eta.score` (R48, R52). Slice 4 writes and posts it."""
+    """Every job merged or dropped: one `wave_close` with the merged jobs' (first ETA, delivered) pairs and their `eta.score` (R48, R52),
+    and the dropped jobs apart, never scored. Slice 4 writes and posts it."""
     w.closed_at = now
     pairs, scored = [], []
     for n, j in enumerate(w.jobs, 1):
+        if j.dropped: continue
         for kind, name in (("pr", "pr_eta"), ("review", "review_eta")):
-            first, delivered = getattr(j, name), j.delivered.get(kind)
+            first, delivered = j.first_eta(name), j.delivered.get(kind)
             pairs.append({"job": n, "issue": j.issue, "kind": kind, "first_eta": first, "delivered": delivered})
             if first is not None and delivered is not None: scored.append(eta.Scored(f"job{n}/{kind}", _dt(first), _dt(delivered)))
     ref = close_ref(w)
     w.pending = w.pending + [Action("post", ref, {"thread": w.thread, "post_kind": "report", "text": close_text(w, pairs, ref)}).to_dict()]
-    merged = [{"job": n, "issue": j.issue, "pr": (j.round.get("pr") or {}).get("number"), "sha": j.merge_sha, "merged_at": j.merged_at} for n, j in enumerate(w.jobs, 1)]
-    return [Action("wave_close", f"{w.thread}/wave/close", {"thread": w.thread, "wave": w.name, "jobs": merged, "etas": pairs, "score": asdict(eta.score(scored)), "findings": list(w.findings)})]
+    merged = [{"job": n, "issue": j.issue, "pr": (j.round.get("pr") or {}).get("number"), "sha": j.merge_sha, "merged_at": j.merged_at} for n, j in enumerate(w.jobs, 1) if j.merged]
+    dropped = [{"job": n, "issue": j.issue, "reason": j.drop_reason, "dropped_at": j.dropped_at} for n, j in enumerate(w.jobs, 1) if j.dropped]
+    return [Action("wave_close", f"{w.thread}/wave/close", {"thread": w.thread, "wave": w.name, "jobs": merged, "dropped": dropped, "etas": pairs, "score": asdict(eta.score(scored)), "findings": list(w.findings)})]
 
 
 def close_ref(w: Wave) -> str: return f"fm-wave-{w.name or 'wave'}-close"
@@ -310,11 +409,14 @@ def close_ref(w: Wave) -> str: return f"fm-wave-{w.name or 'wave'}-close"
 
 def close_text(w: Wave, pairs: list[dict], ref: str) -> str:
     """The one close post: each job's PR and merge, and its ETAs against delivery. The `waves` row is slice 4."""
-    lines = [f"wave {w.name or '-'} closed: {len(w.jobs)}/{len(w.jobs)} jobs merged."]
+    n_merged, n_dropped = sum(j.merged for j in w.jobs), sum(j.dropped for j in w.jobs)
+    lines = [f"wave {w.name or '-'} closed: {n_merged}/{len(w.jobs)} jobs merged" + (f", {n_dropped} dropped." if n_dropped else ".")]
     for n, j in enumerate(w.jobs, 1):
+        if j.dropped: continue
         got = {p["kind"]: p for p in pairs if p["job"] == n}
         lines.append(f"job {n} #{j.issue}: PR #{(j.round.get('pr') or {}).get('number') or '-'} merged {str(j.merge_sha)[:7] or '-'}; "
                      f"PR {arbiter.eta_line(got['pr']['first_eta'])}, delivered {_at(got['pr']['delivered'])}; review {arbiter.eta_line(got['review']['first_eta'])}, delivered {_at(got['review']['delivered'])}")
+    lines += [f"job {n} #{j.issue} dropped: {j.drop_reason}" for n, j in enumerate(w.jobs, 1) if j.dropped]
     if w.findings: lines.append(f"{len(w.findings)} wave findings.")
     return "\n".join(lines + [f"ref: {ref}"])
 
@@ -326,13 +428,15 @@ def _dt(ts: float) -> datetime: return datetime.fromtimestamp(ts, timezone.utc)
 
 
 def status_lines(w: Wave) -> list[str]:
-    """`wave status`: one line per job, then the wave."""
+    """`wave status`: one line per job, then the wave, then every finding's text (the wave's, then each job round's)."""
     out = []
     for n, j in enumerate(w.jobs, 1):
         r = j.rnd()
         pr = r.pr.get("number")
-        out.append(f"job {n}\t#{j.issue}\t{'merged' if j.merged else r.stage}\tPR {('#%d@%s' % (pr, str(r.pr.get('head', ''))[:7])) if pr else '-'}\t"
+        out.append(f"job {n}\t#{j.issue}\t{'merged' if j.merged else ('dropped: ' + j.drop_reason) if j.dropped else r.stage}\tPR {('#%d@%s' % (pr, str(r.pr.get('head', ''))[:7])) if pr else '-'}\t"
                    f"{arbiter.eta_line(j.pr_eta).replace('ETA', 'PR ETA')}\t{arbiter.eta_line(j.review_eta).replace('ETA', 'review ETA')}\t"
                    f"{j.person('implementer').get('login', '?')} -> {j.person('auditor').get('login', '?')}\t{len(j.files)} paths{' Config' if j.config_change else ''}\t{len(r.findings)} findings")
     out.append(f"wave {w.name or '-'}\t{w.thread}\t{'closed ' + arbiter.et_time(w.closed_at) if w.closed_at else 'open'}\t{sum(j.merged for j in w.jobs)}/{len(w.jobs)} merged\t{len(w.findings)} findings")
+    out += [f"finding (wave): {f}" for f in w.findings]
+    out += [f"finding (job {n}): {f}" for n, j in enumerate(w.jobs, 1) for f in j.rnd().findings]
     return out
