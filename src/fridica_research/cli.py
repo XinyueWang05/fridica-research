@@ -1,4 +1,4 @@
-"""`fridica-research start | adopt | list | stop | resume | note | pr | serve | replay | score` (argparse, stdlib only)."""
+"""`fridica-research start | adopt | list | stop | resume | note | pr | serve | replay | score | wave` (argparse, stdlib only)."""
 from __future__ import annotations
 
 import argparse
@@ -8,7 +8,7 @@ import sys
 import time
 from dataclasses import asdict
 
-from . import arbiter, config, contracts, ledger, provenance
+from . import arbiter, config, contracts, ledger, provenance, wave
 from .board import Board, Projects, role_totals
 from .client import Client, read_capability
 from .driver import Driver, claude_runner
@@ -127,6 +127,37 @@ def cmd_pr(cfg: config.Config, args) -> int:
         store.close()
 
 
+def cmd_wave(cfg: config.Config, args) -> int:
+    """#69 part a: `wave open <thread> --job …` records a wave and its jobs (the floor manager's ETAs, never computed); `wave status <thread>` prints it. Driver wiring is slice 3."""
+    store = Store(cfg.state_file)
+    try:
+        key = wave.wave_key(args.thread)
+        if args.wave_cmd == "status":
+            raw = store.get_meta(key)
+            if raw is None:
+                print(f"{args.thread} is not an open wave", file=sys.stderr)
+                return 1
+            for line in wave.status_lines(wave.Wave.from_json(raw)): print(line)
+            return 0
+        if store.load(args.thread) is not None or store.get_meta(arbiter.round_key(args.thread)) is not None:
+            print(f"{args.thread} is an AI study or an adopted round; wave open is for a wave thread", file=sys.stderr)
+            return 1
+        if store.get_meta(key) is not None:
+            print(f"{args.thread} is already an open wave", file=sys.stderr)
+            return 1
+        try:
+            w = wave.open_wave(args.thread, name=args.name, repo=args.repo, jobs=[wave.parse_job(j) for j in args.job], now=time.time(), cfg=cfg)
+        except (wave.WaveError, ValueError) as e:
+            print(str(e), file=sys.stderr)
+            return 1
+        store.set_meta(key, w.to_json())
+        print(f"opened wave {w.name or '-'} on {w.thread} with {len(w.jobs)} job(s); the ETAs are recorded as given (R49); the serving driver feeds the thread in slice 3")
+        for line in wave.status_lines(w): print(line)
+        return 0
+    finally:
+        store.close()
+
+
 def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="fridica-research", description="Drive fridica's auto-research studies over the control socket.")
     p.add_argument("--config", default=None, help=f"research.toml (default {config.DEFAULT_PATH})")
@@ -174,6 +205,16 @@ def parser() -> argparse.ArgumentParser:
     sc.add_argument("ledger", help="path of an existing ledger; a missing path is an error, never a new ledger")
     sc.add_argument("--tolerance", type=float, default=0.0, metavar="H", help="hours around the ETA that count as on time")
     sc.add_argument("--board", action="store_true", help="also write the table to the Project v2 readme")
+    wv = sub.add_parser("wave", help="a wave thread holding N parallel jobs (#69, R53); the driver runs this, never the crew")
+    wsub = wv.add_subparsers(dest="wave_cmd", required=True)
+    wo = wsub.add_parser("open", help="record a wave and its jobs; the ETAs and assignments are the floor manager's (R49) and are recorded, never computed")
+    wo.add_argument("thread", help="the wave thread id, workspace:channel:root_ts")
+    wo.add_argument("--name", default="", help="the <w> of the thread's `ref: fm-wave-<w>-jobN` lines (e.g. d)")
+    wo.add_argument("--repo", default="", help="owner/name of the jobs' issues and PRs")
+    wo.add_argument("--job", action="append", default=[], required=True,
+                    help="issue=N;files=a.py,b/;implementer=U…:login;auditor=U…:login;pr_eta=2026-10-12T02:20Z;review_eta=…[;input_at=…][;config_change=yes] (repeatable, one per job)")
+    ws = wsub.add_parser("status", help="print the wave's jobs: stage, PR, ETAs, people, findings")
+    ws.add_argument("thread")
     return p
 
 
@@ -218,6 +259,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd in ("stop", "resume"): return cmd_command(cfg, args, args.cmd)
     if args.cmd == "note": return cmd_command(cfg, args, f"note:{args.text}")
     if args.cmd == "pr": return cmd_pr(cfg, args)
+    if args.cmd == "wave": return cmd_wave(cfg, args)
     return cmd_serve(cfg, args)
 
 
