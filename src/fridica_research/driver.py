@@ -15,7 +15,7 @@ import subprocess
 import time
 from typing import Callable
 
-from . import arbiter, briefs, contracts, github, machine, provenance
+from . import arbiter, briefs, contracts, github, machine, provenance, wave as wave_mod
 from .client import Client, ControlError, Unavailable
 from .config import Config
 from .machine import Action, Event, State
@@ -66,6 +66,7 @@ class Driver:
         thread = thread_id(e)
         kind = e.get("kind")
         if not thread: return []
+        if self.store.get_meta(wave_mod.wave_key(thread)) is not None: return []  # #69: a wave thread is the wave's
         if self.store.get_meta(arbiter.round_key(thread)) is not None: return []  # #46: an adopted thread is the arbiter's, never the study machine's
         state = self.store.load(thread)
         if kind in ("message", "peer_post"):
@@ -262,26 +263,94 @@ class Driver:
             rnd.pending = kept
             self.save_round(rnd)
 
-    def execute_round(self, rnd: arbiter.Round, a: Action) -> str | None:
-        """Execute one arbiter action through the existing primitives.
+    def execute_round(self, rnd: arbiter.Round, a: Action, thread: str | None = None) -> str | None:
+        """Execute one arbiter action through the existing primitives; posts go to `thread` (a wave's) when given.
 
         Returns None when the action is done with (sent, or already in the thread by its `ref:`), and the
         refusal when the daemon would not take it, which keeps a durable action pending for the next pass."""
         if a.kind not in arbiter.ACTION_KINDS: raise ValueError(f"the arbiter may not emit {a.kind}")
-        log.info("%s %s %s", rnd.thread, a.kind, a.id)
+        where = thread or rnd.thread
+        log.info("%s %s %s", where, a.kind, a.id)
         try:
             if a.kind == "post":
-                if self.posted_with_ref(rnd.thread, a.id): return None  # restart: the post is already in the thread
-                self.client.post_message(rnd.thread, contracts.PostRequest(a["post_kind"], a["text"]))
+                if self.posted_with_ref(where, a.id): return None  # restart: the post is already in the thread
+                self.client.post_message(where, contracts.PostRequest(a["post_kind"], a["text"]))
             elif a.kind == "notify_owner":
-                if self.posted_with_ref(rnd.thread, a.id): return None
-                self.client.post_message(rnd.thread, contracts.PostRequest("report", f"<@{self.cfg.owner}> {a['text']}\nref: {a.id}"))
+                if self.posted_with_ref(where, a.id): return None
+                self.client.post_message(where, contracts.PostRequest("report", f"<@{self.cfg.owner}> {a['text']}\nref: {a.id}"))
             elif a.kind == "board_update":
                 self.board_fields(a)
         except ControlError as e:
             log.warning("round %s %s failed: %s", a.kind, a.id, e)
             return f"{a.kind} {a.id} refused: {e}"
         return None
+
+    # -- wave threads (#69 part b) -------------------------------------------------
+    def waves(self) -> list[str]:
+        """Threads holding an open or closed wave: `wave:<thread>` meta keys."""
+        return [r[0].split(":", 1)[1] for r in self.store.db.execute("SELECT key FROM meta WHERE key LIKE 'wave:%' ORDER BY key")]
+
+    def load_wave(self, thread: str) -> wave_mod.Wave | None:
+        raw = self.store.get_meta(wave_mod.wave_key(thread))
+        return wave_mod.Wave.from_json(raw) if raw else None
+
+    def save_wave(self, w: wave_mod.Wave): self.store.set_meta(wave_mod.wave_key(w.thread), w.to_json())
+
+    def observe_wave(self, e: dict) -> bool:
+        """A feed event in a wave thread: `wave.observe`, then its actions. True when the thread holds a wave."""
+        thread = thread_id(e)
+        w = self.load_wave(thread) if thread else None
+        if w is None: return False
+        ev = round_event(e, self.clock())
+        if ev is not None: self.wave_event(w, ev)
+        return True
+
+    def wave_event(self, w: wave_mod.Wave, ev: Event) -> wave_mod.Wave:
+        """One event through the wave: saved before anything is sent, then the pending posts and the other actions."""
+        w, actions = wave_mod.observe(w, ev, self.cfg)
+        self.save_wave(w)
+        self.drain_wave(w)
+        for a in actions:
+            if a.kind in arbiter.DURABLE or a.kind == "wave_close": continue  # durable ones are drained; the `waves` row is slice 4
+            self.execute_round(arbiter.Round(thread=w.thread), a, thread=w.thread)
+        return w
+
+    def drain_wave(self, w: wave_mod.Wave):
+        """Each job's pending posts, then the close, into the wave thread; a refused one stays for the next pass."""
+        changed = False
+        for j in w.jobs:
+            pending = list(j.round.get("pending") or [])
+            kept = [d for d in pending if self.execute_round(j.rnd(), arbiter.action_from_dict(d), thread=w.thread)]
+            if kept != pending: j.round["pending"], changed = kept, True
+        kept = [d for d in w.pending if self.execute_round(arbiter.Round(thread=w.thread), arbiter.action_from_dict(d), thread=w.thread)]
+        if kept != w.pending: w.pending, changed = kept, True
+        if changed: self.save_wave(w)
+
+    def flush_waves(self):
+        for thread in self.waves():
+            w = self.load_wave(thread)
+            if w is not None and (w.pending or any(j.round.get("pending") for j in w.jobs)): self.drain_wave(w)
+
+    def poll_waves(self):
+        """One `read_pr` per open job per pass; a merged job is never polled. A PR read as MERGED is fed as a `merged` event."""
+        run = self.gh_runner()
+        if run is None: return
+        for thread in self.waves():
+            w = self.load_wave(thread)
+            if w is None: continue
+            for n, j in enumerate(w.jobs, 1):
+                rnd = j.rnd()
+                if j.merged or not rnd.repo or not rnd.issue: continue
+                try: ev = self.read_pr(rnd, run)
+                except Exception as e:  # noqa: BLE001 - a GitHub read never stalls a wave; the next pass reads again
+                    log.warning("pr read for wave %s job %d failed: %s", thread, n, e)
+                    continue
+                if ev is None: continue
+                view = ev.get("view") or {}
+                if view.get("state") == "MERGED":
+                    ev = Event("merged", ev.now, {"job": n, "pr": rnd.pr["number"], "sha": str((view.get("mergeCommit") or {}).get("oid") or "")})
+                else: ev = Event(ev.kind, ev.now, {**ev.data, "job": n})
+                w = self.wave_event(w, ev)
 
     def gh_runner(self):
         """The gh runner a round's PR is read with: the GitHub one when `[github]` is on, else the enabled board's; None reads nothing."""
@@ -357,6 +426,7 @@ class Driver:
         if not self.recovered: self.recover()
         self.commands()
         self.flush_rounds()
+        self.flush_waves()
         try: page = self.client.events(self.store.cursor, 1000)
         except Unavailable as e:
             log.warning("daemon unavailable: %s", e)
@@ -367,7 +437,7 @@ class Driver:
         for e in events:
             if e.get("kind") == "job" and e.get("action") == "failed" and e.get("job_id") in results: continue  # #45: the job_result beside it is the completion
             cursor = int(e.get("cursor", page["next"]))
-            if self.observe_round(e):
+            if self.observe_wave(e) or self.observe_round(e):
                 n += 1
                 continue
             for thread, ev in self.translate(e):
@@ -376,6 +446,7 @@ class Driver:
         self.store.set_cursor(int(page["next"]))
         self.fire_timers()
         self.poll_rounds()
+        self.poll_waves()
         self.poll_github()
         return n, int(page.get("scanned", 0)) < 1000
 
