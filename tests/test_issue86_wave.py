@@ -115,3 +115,19 @@ def test_serve_runs_with_closed_wave_or_no_wave(tmp_path, monkeypatch):
 def test_serve_runs_open_wave_with_github_or_board(tmp_path, monkeypatch):
     store_wave(tmp_path, closed=False)
     assert serve(tmp_path, monkeypatch, "[github]\nenabled = true\n") == 0 and StubDriver.served == [True]
+
+
+def test_empty_job_repo_does_not_override_wave_repo(tmp_path, capsys):
+    """#101: `repo=` with an empty value in a job spec is unset, so the job takes the wave's repo and is polled."""
+    w = wave.open_wave(THREAD, name="f", repo=REPO, jobs=[{**job(), "repo": ""}], now=T0, cfg=CFG)
+    assert w.jobs[0].repo == REPO and w.jobs[0].round["repo"] == REPO
+    w = wave.open_wave(THREAD, name="f", repo=REPO, jobs=[wave.parse_job(JOB + ";repo= ")], now=T0, cfg=CFG)
+    assert w.jobs[0].repo == REPO and w.jobs[0].round["repo"] == REPO
+    cfgp = write_config(tmp_path)
+    assert cli.main(["--config", cfgp, "wave", "open", THREAD, "--name", "f", "--repo", REPO, "--job", JOB + ";repo="]) == 0
+    add = "issue=93;files=src/fridica_research/cli.py;implementer=U0IMP2:imp2;auditor=U0AUD2:aud2;pr_eta=2026-10-12T15:35Z;review_eta=2026-10-12T16:00Z;repo="
+    assert cli.main(["--config", cfgp, "wave", "add-job", THREAD, "--job", add]) == 0
+    s = Store(tmp_path / "s.sqlite3")
+    stored = wave.Wave.from_json(s.get_meta(wave.wave_key(THREAD)))
+    s.close()
+    assert [(j.repo, j.round["repo"]) for j in stored.jobs] == [(REPO, REPO), (REPO, REPO)]

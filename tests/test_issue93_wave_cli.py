@@ -160,3 +160,16 @@ def test_cli_wave_commands(tmp_path, capsys):
 def test_cli_drop_needs_reason(tmp_path):
     with pytest.raises(SystemExit):
         cli.main(["--config", write_config(tmp_path), "wave", "drop", THREAD, "1"])
+
+
+def test_dropped_job_merged_finding_recorded_once_even_after_close():
+    """#101 B1: the driver still polls a dropped job; each poll that reads its PR as MERGED folds a `merged` event. One finding per job."""
+    w = wave.bind_pr(wave.bind_pr(opened(), 1, 101, now=T0 + H), 2, 102, now=T0 + H)
+    w, _ = wave.drop_job(w, 2, "superseded", now=T0 + 2 * H)
+    for k in range(3): w, out = merged(w, 2, 102, T0 + 3 * H + k)
+    assert out == [] and len([f for f in w.findings if "after the job was dropped" in f]) == 1
+    w, actions = merged(w, 1, 101, T0 + 4 * H)
+    assert w.closed_at == T0 + 4 * H and [a.kind for a in actions] == ["wave_close"]
+    for k in range(3): w, out = merged(w, 2, 102, T0 + 5 * H + k)
+    assert out == [] and len([f for f in w.findings if "after the job was dropped" in f]) == 1
+    assert w.jobs[1].dropped and not w.jobs[1].merged

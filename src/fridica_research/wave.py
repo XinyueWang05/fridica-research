@@ -106,6 +106,7 @@ class Job:
     first_etas: dict = field(default_factory=dict)  # {"pr_eta", "review_eta"} as opened (or added); `set_eta` never changes it, `close()` scores it
     dropped_at: float | None = None
     drop_reason: str = ""
+    merged_after_drop: float | None = None  # the first `merged` event seen for a dropped job: its finding is written once, then never again
 
     def rnd(self) -> arbiter.Round: return arbiter.Round.from_dict(self.round)
     def person(self, role: str) -> dict: return dict(getattr(self, role) or {})
@@ -168,7 +169,7 @@ def parse_job(spec: str) -> dict:
         if not part.strip(): continue
         key, sep, value = part.partition("=")
         key, value = key.strip(), value.strip()
-        if not sep or key not in Job.__dataclass_fields__ or key in ("round", "delivered", "merged_at", "merge_sha", "first_etas", "dropped_at", "drop_reason"):
+        if not sep or key not in Job.__dataclass_fields__ or key in ("round", "delivered", "merged_at", "merge_sha", "first_etas", "dropped_at", "drop_reason", "merged_after_drop"):
             raise WaveError(f"--job: {part.strip()!r} is not one of issue, files, implementer, auditor, input_at, pr_eta, review_eta, config_change, repo")
         if key == "issue": out[key] = int(value)
         elif key == "files": out[key] = [f.strip() for f in value.split(",") if f.strip()]
@@ -215,6 +216,7 @@ def load_register(cfg: Config) -> register_mod.Register | None:
 
 
 def build_job(n: int, spec: dict, repo: str, now: float, cfg: Config, reg: register_mod.Register | None) -> Job:
+    spec = {k: v for k, v in spec.items() if not (k == "repo" and not str(v or "").strip())}  # an empty `repo=` is unset: the wave's repo
     j = Job.from_dict({**{"repo": repo or ""}, **spec})
     j.input_at = parse_time(j.input_at) if j.input_at is not None else now
     j.pr_eta, j.review_eta = parse_time(j.pr_eta), parse_time(j.review_eta)
@@ -369,8 +371,10 @@ def observe(wave: Wave, ev: Event, cfg: Config) -> tuple[Wave, list[Action]]:
             w.findings.append(f"job {n} (#{j.issue}): merged event for PR #{ev['pr']}, but the job's PR is #{recorded}; ignored")
             return w, []
         if j.merged: return w, []
-        if j.dropped:
-            w.findings.append(f"job {n} (#{j.issue}): merged event for PR #{ev.get('pr') or '-'} after the job was dropped; ignored")
+        if j.dropped:  # the driver polls a dropped job until Wave G: one finding per job, before and after the close
+            if j.merged_after_drop is None:
+                j.merged_after_drop = ev.now
+                w.findings.append(f"job {n} (#{j.issue}): merged event for PR #{ev.get('pr') or '-'} after the job was dropped; ignored")
             return w, []
         if not merge_ready(j): w.findings.append(f"job {n} (#{j.issue}): merged on GitHub before it was merge-ready (round at {j.rnd().stage}); the merge is ground truth")
         j.merged_at, j.merge_sha = ev.now, str(ev.get("sha") or "")
