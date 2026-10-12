@@ -25,7 +25,7 @@ from .store import Store
 log = logging.getLogger("fridica_research.driver")
 LlmRunner = Callable[[str, str], dict]  # (schema name, prompt) -> payload
 ETA_FIELD = "ETA"  # the board text field a wave job's `dates["eta_text"]` goes to (#110); `Board.set_dates` takes dates only
-NOT_FOUND = re.compile(r"could not resolve to a pullrequest|no pull requests? found|not found|http 404", re.I)  # gh's answers for a PR number that is not a PR
+NOT_FOUND = re.compile(r"could not resolve to a pullrequest|no pull requests? found|http 404", re.I)  # gh's answers for a PR number that is not a PR; never a bare "not found"
 GH_FAILING_PASSES = 3  # consecutive wave polling passes with a failed GitHub read before the owner is told (#85)
 
 
@@ -367,9 +367,8 @@ class Driver:
                     log.warning("pr read for wave %s job %d failed: %s", thread, n, e)
                     error = error or e
                     continue
-                cur = w.jobs[n - 1].round.get("pr") or {}  # `w` is the latest fold, not the wave this loop started from
-                if had and "candidate" not in rnd.pr and cur.get("candidate") == had:  # read_pr dropped a not-found candidate
-                    cur.pop("candidate")
+                if had and "candidate" not in rnd.pr:  # read_pr dropped a not-found candidate; `rnd.pr` may be `w`'s own dict, so always save
+                    (w.jobs[n - 1].round.get("pr") or {}).pop("candidate", None)  # `w` is the latest fold, not the wave this loop started from
                     self.save_wave(w)
                 if ev is None: continue
                 view = ev.get("view") or {}
@@ -554,21 +553,28 @@ class Driver:
                 if a.kind not in arbiter.DURABLE: self.execute_round(rnd, a)
 
     def read_pr(self, rnd: arbiter.Round, run) -> Event | None:
+        """`pr_polled` for the round. With no PR recorded: the candidate's view first (job 4's candidate may be another author's
+        PR, which `list_prs --author` would miss); when it cannot be adopted (closed, another author, no Closes/Refs line) or its
+        view fails, the implementer's own listing follows on the same pass, after the view, so the arbiter can still say why the
+        candidate was not adopted. A not-found candidate is dropped from `rnd.pr`; the caller saves that."""
         now = self.clock()
-        if not rnd.pr.get("number") and rnd.pr.get("candidate"):  # job 4's candidate may be another author's PR: `list_prs --author` would miss it
+        cand: list[dict] = []
+        if not rnd.pr.get("number") and rnd.pr.get("candidate"):
             n = int(rnd.pr["candidate"])  # the adoption fields (`LIST_FIELDS`: number, author, body, ...): `view_pr` reads no body
             try:
                 view = json.loads(run(["gh", "pr", "view", str(n), "-R", rnd.repo, "--json", github.LIST_FIELDS], None) or "{}")
                 view.setdefault("number", n)
-                return Event("pr_polled", now, {"prs": [view]})
+                cand = [view]
+                if arbiter.pick_pr(rnd, cand, self.cfg) is not None: return Event("pr_polled", now, {"prs": cand})
             except Exception as e:  # noqa: BLE001 - a bad candidate never blocks adoption: the author listing below runs this pass
                 gone = bool(NOT_FOUND.search(str(e)))
                 log.warning("candidate PR #%s for %s %s: %s", n, rnd.thread, "not found, dropped" if gone else "view failed", e)
-                if gone: rnd.pr.pop("candidate", None)  # the caller saves the drop
+                if gone: rnd.pr.pop("candidate", None)
         if not rnd.pr.get("number"):
             me = rnd.login("implementer", self.cfg)
-            if not me: return None  # whose PR is "own" is unknown: nothing to adopt
-            return Event("pr_polled", now, {"prs": github.list_prs(run, rnd.repo, me)})
+            if not me: return Event("pr_polled", now, {"prs": cand}) if cand else None  # whose PR is "own" is unknown: only the candidate
+            seen = {int(p.get("number") or 0) for p in cand}
+            return Event("pr_polled", now, {"prs": cand + [p for p in github.list_prs(run, rnd.repo, me) if int(p.get("number") or 0) not in seen]})
         pr = f"{rnd.repo}#{rnd.pr['number']}"
         return Event("pr_polled", now, {"view": github.view_pr(run, pr), "reviews": github.pr_reviews(run, pr)})
 

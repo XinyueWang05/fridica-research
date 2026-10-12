@@ -95,9 +95,9 @@ def test_the_candidate_pr_is_viewed_directly(tmp_path):
     try: drv.run_once()
     finally: pick.pick_pr = orig
     assert any(a[:4] == ["gh", "pr", "view", "80"] for a in gh.calls)
-    assert not any("--author" in a and "imp3" in a for a in gh.calls)
-    fed = [prs for issue, prs in seen if issue == 61]
-    assert fed and len(fed[0]) == 1 and fed[0][0]["number"] == 80 and fed[0][0]["headRefOid"] == HEAD
+    fed = [prs for issue, prs in seen if issue == 61 and prs]
+    assert fed and fed[0][0]["number"] == 80 and fed[0][0]["headRefOid"] == HEAD  # the candidate's view comes first
+    assert any("--author" in a and "imp3" in a for a in gh.calls)  # not adoptable (another author): the listing follows (Xi, 0f4c795)
 
 
 def test_a_recorded_pr_wins_over_the_candidate(tmp_path):
@@ -237,3 +237,49 @@ def test_another_candidate_error_is_logged_and_list_prs_runs_that_pass(tmp_path,
     pr = stored(store).jobs[2].rnd().pr
     assert author_listings(gh, "imp3") == 1 and pr.get("number") == 73
     assert "HTTP 502" in caplog.text and "999" in caplog.text
+
+
+# -- Xi's findings on 0f4c795 -------------------------------------------------------------------------------------------
+def set_candidate(store, n: int, candidate: int, **round_edits):
+    w = stored(store)
+    w.jobs[n - 1].round.setdefault("pr", {})["candidate"] = candidate
+    for k, v in round_edits.items(): w.jobs[n - 1].round[k] = v
+    store.set_meta(wave.wave_key(THREAD), w.to_json())
+
+
+def test_another_authors_candidate_does_not_block_the_implementers_pr(tmp_path):
+    store, client, gh, clock, drv = failing_candidate_world(tmp_path)
+    set_candidate(store, 3, 72)  # imp2's PR for #54: it exists, but job 3 cannot adopt it
+    for _ in range(4):
+        drv.run_once()
+        clock.t += H
+    assert stored(store).jobs[2].rnd().pr.get("number") == 73 and author_listings(gh, "imp3") >= 1
+
+
+def test_a_closed_candidate_does_not_block_the_implementers_pr(tmp_path):
+    store, client, gh, clock, drv = failing_candidate_world(tmp_path)
+    gh.prs[74] = {"author": "imp3", "issue": 61, "state": "CLOSED", "head": HEAD}
+    set_candidate(store, 3, 74)
+    drv.run_once()  # the same pass: the view, then the author listing
+    assert stored(store).jobs[2].rnd().pr.get("number") == 73 and author_listings(gh, "imp3") == 1
+
+
+def test_a_not_found_drop_is_saved_when_nothing_is_read(tmp_path):
+    store, client, gh, clock, drv = failing_candidate_world(tmp_path)
+    w = stored(store)
+    w.jobs[2].round["pr"].pop("candidate")
+    w.jobs[0].round.setdefault("pr", {})["candidate"] = 999  # job 1: the first read of the pass, so its round is the loaded wave's own dict
+    w.jobs[0].round["roster"] = {**(w.jobs[0].round.get("roster") or {}), "implementer": {"holders": ["U0NOBODY"]}}  # no login: read_pr returns None
+    for n in (2, 3): w, _ = wave.drop_job(w, n, "descoped", now=clock.t)  # job 1 is the only read: no other fold saves the wave by chance
+    store.set_meta(wave.wave_key(THREAD), w.to_json())
+    for _ in range(4):
+        drv.run_once()
+        clock.t += H
+    assert sum(1 for a in gh.calls if a[:4] == ["gh", "pr", "view", "999"]) == 1 and "candidate" not in stored(store).jobs[0].rnd().pr
+
+
+def test_an_unrelated_not_found_error_keeps_the_candidate(tmp_path):
+    store, client, gh, clock, drv = failing_candidate_world(tmp_path, view_error="HTTP 500: template not found in cache")
+    gh.prs.pop(73)  # nothing to adopt: an adoption clears the candidate on its own (#110)
+    drv.run_once()
+    assert stored(store).jobs[2].rnd().pr.get("candidate") == 999 and author_listings(gh, "imp3") == 1
