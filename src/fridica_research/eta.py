@@ -1,7 +1,8 @@
 """R49: the floor manager's ETA estimator, and the R48/R52 score over committed ETAs (#53).
 
 Pure: no I/O, no network, no clock. Every time the estimator needs comes in as an argument,
-so the same inputs always give the same ETA and the module is replayable.
+so the same inputs always give the same ETA and the module is replayable. A naive datetime is
+read as UTC wherever it meets an aware one, so a report and a clock may mix the two.
 
     eta = input time + work + a buffer specific to the Innie
 
@@ -32,7 +33,7 @@ Scoring (R48, R52) is over the **first committed** ETA only. A re-estimate never
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from statistics import fmean
 
 HOUR = timedelta(hours=1)
@@ -44,6 +45,12 @@ WORK_BASES = ("trial", "history", "reasoning")  # the ledger's `jobs.est_basis` 
 
 def _hours(delta: timedelta) -> float:
     return delta / HOUR
+
+
+def _like(t: datetime, ref: datetime) -> datetime:
+    """`t` in the same kind as `ref`: a naive time is read as UTC, and an aware one is converted to naive UTC when `ref` is naive."""
+    if (t.tzinfo is None) == (ref.tzinfo is None): return t
+    return t.replace(tzinfo=timezone.utc) if t.tzinfo is None else t.astimezone(timezone.utc).replace(tzinfo=None)
 
 
 # -- evidence -------------------------------------------------------------------
@@ -162,7 +169,7 @@ def offline_hours(report: WorkloadReport | None, buf: InnieBuffer, start: dateti
     """#64 note 2: a report that names `offline_until` settles the offline buffer (the hours left, zero
     when it is at or before the start); a report that names none keeps the Innie's history buffer."""
     if report is None or report.offline_until is None: return buf.offline_hours
-    return max(0.0, _hours(report.offline_until - start))
+    return max(0.0, _hours(_like(report.offline_until, start) - start))
 
 
 def estimate(now: datetime, innie: str, *, buffer: InnieBuffer | None = None, workload: WorkloadReport | None = None,
@@ -196,8 +203,8 @@ def estimate(now: datetime, innie: str, *, buffer: InnieBuffer | None = None, wo
     # quota (R50 amendment): a session used past SESSION_QUOTA with a known reset moves the input time to that reset.
     # A stale report settles nothing here either: both the quota and the cap come from a fresh report only.
     cause = ""
-    if report is not None and report.quota_exhausted and report.session_reset is not None and report.session_reset > start:
-        start, cause = report.session_reset, "quota"
+    if report is not None and report.quota_exhausted and report.session_reset is not None and (reset := _like(report.session_reset, start)) > start:
+        start, cause = reset, "quota"
     capped = report is not None and report.capped
 
     # buffer: each piece only when this job actually pays for it.

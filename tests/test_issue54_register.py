@@ -10,7 +10,7 @@ from __future__ import annotations
 import dataclasses
 import re
 import sqlite3
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -78,10 +78,25 @@ def test_register_rejects_a_missing_required_field(missing):
 
 
 def test_register_rejects_an_unknown_field():
-    with pytest.raises(register.RegisterError, match=r"\[innie.jiheng\]: unknown field\(s\) backend, shoe_size"):
-        register.parse(TOML.replace('host = "local"', 'host = "local"\nbackend = "claude"\nshoe_size = 42'))
+    with pytest.raises(register.RegisterError, match=r"\[innie.jiheng\]: unknown field\(s\) engine, shoe_size"):
+        register.parse(TOML.replace('host = "local"', 'host = "local"\nengine = "claude"\nshoe_size = 42'))
     with pytest.raises(register.RegisterError, match="unknown top-level key"):
         register.parse('[people]\nx = "y"\n' + TOML)
+
+
+def test_backend_is_an_alias_for_client_and_setting_both_is_an_error():
+    j = register.parse(TOML.replace('client = "claude"', 'backend = "codex"')).get("jiheng")
+    assert j.client == "codex"
+    with pytest.raises(register.RegisterError, match=r"\[innie.jiheng\]: set client or backend, not both"):
+        register.parse(TOML.replace('client = "claude"', 'client = "claude"\nbackend = "claude"'))
+
+
+@pytest.mark.parametrize("field", ["hours", "offline"])
+def test_register_refuses_a_zero_length_window(field):
+    with pytest.raises(register.RegisterError, match=rf"\[innie.jiheng\].{field}: zero-length window"):
+        register.parse(re.sub(rf'^{field} = ".*"$', f'{field} = "10:00-10:00"', TOML, flags=re.M))
+    with pytest.raises(register.RegisterError, match="zero-length window"):
+        register.window("00:00-00:00", "x")
 
 
 def test_register_rejects_duplicate_ids():
@@ -232,6 +247,23 @@ def test_weekly_at_or_past_80_percent_sets_capped():
     assert not estimate(NOW, "alfa", workload=fresh(weekly_usage=79.9), trial=TrialRun(hours=1.0)).capped
     both = estimate(NOW, "alfa", workload=fresh(session_usage=95.0, session_reset=NOW + timedelta(hours=3), weekly_usage=85.0), trial=TrialRun(hours=1.0))
     assert both.capped and both.cause == "quota" and both.input_at == NOW + timedelta(hours=3)
+
+
+def test_a_naive_time_is_treated_as_utc_against_an_aware_now():
+    utc = timezone.utc
+    now = NOW.replace(tzinfo=utc)
+    reset = NOW + timedelta(hours=2)  # naive: read as UTC
+    e = estimate(now, "alfa", workload=WorkloadReport(innie="alfa", reported_at=now - timedelta(minutes=5), session_usage=95.0, session_reset=reset), trial=TrialRun(hours=1.0))
+    assert e.cause == "quota" and e.input_at == reset.replace(tzinfo=utc) and e.eta == now + timedelta(hours=3)
+    e = estimate(now, "alfa", workload=WorkloadReport(innie="alfa", reported_at=now - timedelta(minutes=5), offline_until=NOW + timedelta(hours=1)), trial=TrialRun(hours=1.0))
+    assert e.buffer["offline"] == 1.0 and e.eta == now + timedelta(hours=2)
+    # and the other way round: a naive now against aware report times
+    e = estimate(NOW, "alfa", workload=fresh(session_usage=95.0, session_reset=now + timedelta(hours=2), offline_until=now + timedelta(hours=3)), trial=TrialRun(hours=1.0))
+    assert e.cause == "quota" and e.input_at == NOW + timedelta(hours=2) and e.buffer["offline"] == 1.0
+    # an aware time in another zone is converted, not read as wall-clock
+    est = timezone(timedelta(hours=-4))
+    e = estimate(NOW, "alfa", workload=fresh(session_usage=95.0, session_reset=datetime(2026, 10, 11, 16, 0, tzinfo=est)), trial=TrialRun(hours=1.0))
+    assert e.input_at == NOW + timedelta(hours=2)
 
 
 def test_a_stale_report_ignores_both_the_quota_and_the_cap():
