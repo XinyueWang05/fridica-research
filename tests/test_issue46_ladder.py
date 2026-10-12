@@ -28,6 +28,7 @@ W = 30 * MIN
 EPS = 1e-3
 REF = "fm-wave-e-job2"
 HOLDER, OWNER, OUTIE = "UHOLD", "UOWNER", "UOUTIE"
+K = f"{REF}/{HOLDER}@{int(ETA)}"  # #83: rung ids are keyed per holder and ETA
 
 
 def view(**kw) -> ladder.JobView:
@@ -37,7 +38,7 @@ def view(**kw) -> ladder.JobView:
 
 
 def kinds(actions) -> list[str]: return [a.kind for a in actions]
-def checked_in(**kw) -> ladder.JobView: return view(**{"checkin_at": ETA, "done": {f"{REF}/checkin"}, **kw})
+def checked_in(**kw) -> ladder.JobView: return view(**{"checkin_at": ETA, "done": {f"{K}/checkin"}, **kw})
 
 
 # -- W ------------------------------------------------------------------------------------
@@ -47,10 +48,10 @@ def test_window_is_a_quarter_of_the_estimate_clamped_to_15_and_60_min(est, w):
 
 
 def test_the_clamps_set_the_reschedule_time():
-    short = view(est=10 * MIN, eta=T0 + 10 * MIN, checkin_at=T0 + 10 * MIN, done={f"{REF}/checkin"})
+    short = view(est=10 * MIN, eta=T0 + 10 * MIN, checkin_at=T0 + 10 * MIN, done={f"{K}/checkin"})
     assert ladder.step(short, T0 + 25 * MIN) == []  # ETA + 15 min exactly, not 2.5 min
     assert kinds(ladder.step(short, T0 + 25 * MIN + EPS)) == ["reschedule"]
-    long = view(est=600 * MIN, eta=T0 + 600 * MIN, checkin_at=T0 + 600 * MIN, done={f"{REF}/checkin"})
+    long = view(est=600 * MIN, eta=T0 + 600 * MIN, checkin_at=T0 + 600 * MIN, done={f"{K}/checkin"})
     assert ladder.step(long, T0 + 660 * MIN) == []  # ETA + 60 min exactly, not 150 min
     assert kinds(ladder.step(long, T0 + 660 * MIN + EPS)) == ["reschedule"]
 
@@ -62,8 +63,8 @@ def test_nothing_before_the_eta():
 
 def test_one_check_in_at_the_eta_without_a_deliverable():
     out = ladder.step(view(), ETA)
-    assert kinds(out) == ["post"] and out[0].id == f"{REF}/checkin"
-    assert f"<@{HOLDER}>" in out[0]["text"] and f"ref: {REF}/checkin" in out[0]["text"]
+    assert kinds(out) == ["post"] and out[0].id == f"{K}/checkin"
+    assert f"<@{HOLDER}>" in out[0]["text"] and f"ref: {K}/checkin" in out[0]["text"]
 
 
 def test_no_check_in_with_a_deliverable():
@@ -83,7 +84,7 @@ def test_silent_for_exactly_eta_plus_w_is_not_rescheduled():
 def test_silent_for_more_than_eta_plus_w_reschedules_to_the_first_free_alternative():
     out = ladder.step(checked_in(), ETA + W + EPS)
     assert kinds(out) == ["reschedule"]
-    assert out[0].id == f"{REF}/reschedule/{HOLDER}" and out[0]["from"] == HOLDER and out[0]["to"] == "UFREE1"
+    assert out[0].id == f"{K}/reschedule" and out[0]["from"] == HOLDER and out[0]["to"] == "UFREE1"
 
 
 def test_a_reply_after_the_check_in_stops_the_reschedule():
@@ -96,7 +97,7 @@ def test_a_reply_before_the_check_in_does_not_count():
 
 def test_nobody_free_wakes_the_deputy():
     out = ladder.step(checked_in(alternatives=[{"id": "UBUSY", "free": False}, {"id": HOLDER, "free": True}]), ETA + W + EPS)
-    assert kinds(out) == ["wake_deputy"] and out[0].id == f"{REF}/escalate" and f"<@{OWNER}>" not in out[0]["text"]
+    assert kinds(out) == ["wake_deputy"] and out[0].id == f"{K}/escalate" and f"<@{OWNER}>" not in out[0]["text"]
 
 
 @pytest.mark.parametrize("cause", ["quota", "offline"])
@@ -110,7 +111,7 @@ def test_quota_or_offline_reschedules_at_the_eta_without_a_check_in(cause):
 @pytest.mark.parametrize("cause", ["permission", "hardware", "internet"])
 def test_the_outie_is_asked_for_permission_hardware_or_internet(cause):
     out = ladder.step(view(cause=cause), T0)
-    assert kinds(out) == ["ask_outie"] and out[0]["to"] == OUTIE and out[0].id == f"{REF}/outie/{cause}"
+    assert kinds(out) == ["ask_outie"] and out[0]["to"] == OUTIE and out[0].id == f"{K}/outie/{cause}"
 
 
 @pytest.mark.parametrize("cause", ["quota", "offline", "bug", "scope", None])
@@ -144,12 +145,12 @@ def test_the_done_set_makes_every_action_happen_once():
     assert kinds(resched) == ["reschedule"]
     v = dataclasses.replace(v, done=set(v.done) | {resched[0].id})
     assert ladder.step(v, ETA + 10 * W) == []
-    nobody = checked_in(alternatives=[], done={f"{REF}/checkin", f"{REF}/escalate"})
+    nobody = checked_in(alternatives=[], done={f"{K}/checkin", f"{K}/escalate"})
     assert ladder.step(nobody, ETA + 10 * W) == []
 
 
 def test_step_is_pure_and_takes_a_plain_mapping():
-    d = {"ref": REF, "holder": HOLDER, "owner": OWNER, "est": EST, "eta": ETA, "done": [f"{REF}/checkin"], "checkin_at": ETA,
+    d = {"ref": REF, "holder": HOLDER, "owner": OWNER, "est": EST, "eta": ETA, "done": [f"{K}/checkin"], "checkin_at": ETA,
          "alternatives": [{"id": "UFREE1", "free": True}]}
     snapshot = repr(d)
     a, b = ladder.step(d, ETA + W + EPS), ladder.step(d, ETA + W + EPS)

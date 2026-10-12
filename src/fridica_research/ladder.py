@@ -17,8 +17,11 @@ The rungs:
 
 Every action is executable (#83): it names the job's `thread`, its `text` ends with a `ref:` line, posts carry
 `post_kind` "report", and a `wake_deputy` carries the instruct `client_id` from `deputy.client_id`. A
-reschedule id names the holder it moves the job from (`<ref>/reschedule/<holder>`), so the rungs fire again
+reschedule id names the holder it moves the job from (`<ref>/<holder>@<eta>/reschedule`), so the rungs fire again
 for the next holder.
+
+#83 (wave H): the rung ids are keyed per holder and ETA, `<ref>/<holder>@<eta>/<rung>` (`key`): a reassignment or a
+re-estimate starts a fresh set of rungs, so a second miss checks in and reschedules again. Question ids stay `<ref>/question/<id>`.
 """
 from __future__ import annotations
 
@@ -39,7 +42,7 @@ POST_KIND = "report"
 @dataclass(frozen=True)
 class JobView:
     """What the ladder needs to know about one job. Times are epoch seconds; `est` is in seconds."""
-    ref: str  # the job's ref, e.g. `fm-wave-e-job2`; every action id is `<ref>/<rung>`
+    ref: str  # the job's ref, e.g. `fm-wave-e-job2`; a rung id is `<ref>/<holder>@<eta>/<rung>` (`key`), a question's `<ref>/question/<id>`
     holder: str
     owner: str
     est: float
@@ -66,6 +69,11 @@ def window(est: float) -> float:
     return min(max(0.25 * float(est), W_MIN), W_MAX)
 
 
+def key(v: JobView) -> str:
+    """The prefix of every rung id: the job's ref, its holder and its ETA (whole epoch seconds)."""
+    return f"{v.ref}/{v.holder}@{int(v.eta)}"
+
+
 def step(job_view: "JobView | Mapping", now: float) -> list[Action]:
     """The actions due for this job at `now`, minus those whose ref is already in `done`."""
     v = JobView.of(job_view)
@@ -80,13 +88,13 @@ def step(job_view: "JobView | Mapping", now: float) -> list[Action]:
         else:
             out.append(wake(v, ref, f"{q.get('kind')} question: {q.get('text', '')}".rstrip(), {"kind": q.get("kind")}))
     if cause in OUTIE_CAUSES and v.outie:
-        out.append(_act("ask_outie", f"{v.ref}/outie/{cause}", v, {"to": v.outie, "cause": cause}, f"<@{v.outie}> {v.ref} is blocked on {cause} for <@{v.holder}>."))
+        out.append(_act("ask_outie", f"{key(v)}/outie/{cause}", v, {"to": v.outie, "cause": cause}, f"<@{v.outie}> {v.ref} is blocked on {cause} for <@{v.holder}>."))
 
     if not v.deliverable and now >= v.eta:
         if cause in NO_WAIT:
             out.append(reschedule(v, cause))
         elif v.checkin_at is None:
-            ref = f"{v.ref}/checkin"
+            ref = f"{key(v)}/checkin"
             out.append(_act("post", ref, v, {"to": v.holder}, f"<@{v.holder}> {v.ref} reached its ETA with no deliverable. Where does it stand?"))
         else:
             replied = v.last_reply is not None and v.last_reply > v.checkin_at
@@ -110,5 +118,5 @@ def reschedule(v: JobView, why: str) -> Action:
     """To the first free alternative; with nobody free the deputy decides (escalation is not owner-only)."""
     to = next((str(a.get("id")) for a in v.alternatives or [] if a.get("free") and a.get("id") and a.get("id") != v.holder), None)
     if to is None:
-        return wake(v, f"{v.ref}/escalate", f"<@{v.holder}> is {why} past the ETA and no alternative is free. Reschedule or escalate?", {"why": why})
-    return _act("reschedule", f"{v.ref}/reschedule/{v.holder}", v, {"from": v.holder, "to": to, "why": why}, f"<@{to}> {v.ref} moves to you from <@{v.holder}> ({why}).")
+        return wake(v, f"{key(v)}/escalate", f"<@{v.holder}> is {why} past the ETA and no alternative is free. Reschedule or escalate?", {"why": why})
+    return _act("reschedule", f"{key(v)}/reschedule", v, {"from": v.holder, "to": to, "why": why}, f"<@{to}> {v.ref} moves to you from <@{v.holder}> ({why}).")

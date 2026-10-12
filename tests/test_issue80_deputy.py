@@ -144,7 +144,7 @@ def test_a_question_that_is_not_owner_only_wakes_the_deputy_on_the_thread(kind):
 def test_nobody_free_wakes_the_deputy_instead_of_the_owner():
     v = view(checkin_at=ETA, done={f"{REF}/checkin"}, alternatives=[])
     (a,) = ladder.step(v, ETA + W + EPS)
-    assert a.kind == "wake_deputy" and a.id == f"{REF}/escalate" and a["client_id"] == deputy.client_id(f"{REF}/escalate")
+    assert a.kind == "wake_deputy" and a.id == f"{ladder.key(v)}/escalate" and a["client_id"] == deputy.client_id(a.id)
     assert f"<@{OWNER}>" not in a["text"]
 
 
@@ -158,12 +158,12 @@ def test_posts_name_the_thread_the_report_kind_and_end_with_their_ref():
 def test_reschedule_id_names_the_holder_so_the_next_holder_can_be_rescheduled_again():
     v = view(checkin_at=ETA, done={f"{REF}/checkin"})
     (a,) = ladder.step(v, ETA + W + EPS)
-    assert a.kind == "reschedule" and a.id == f"{REF}/reschedule/{HOLDER}" and a["post_kind"] == "report"
+    assert a.kind == "reschedule" and a.id == f"{REF}/{HOLDER}@{int(ETA)}/reschedule" and a["post_kind"] == "report"
     v = dataclasses.replace(v, done=set(v.done) | {a.id})
     assert ladder.step(v, ETA + W + EPS) == []
     nxt = dataclasses.replace(v, holder="UFREE1", alternatives=[{"id": "UFREE2", "free": True}])
     (b,) = ladder.step(nxt, ETA + W + EPS)
-    assert b.id == f"{REF}/reschedule/UFREE1" and b["to"] == "UFREE2"
+    assert b.id == f"{REF}/UFREE1@{int(ETA)}/reschedule" and b["to"] == "UFREE2"
 
 
 def test_ladder_wake_up_executes_through_instruct_once(control):

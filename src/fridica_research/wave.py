@@ -45,7 +45,8 @@ import json
 import posixpath
 import re
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 from . import arbiter, eta, register as register_mod
 from .config import Config
@@ -56,6 +57,9 @@ ROLES = ("implementer", "auditor")
 ETAS = ("pr_eta", "review_eta")  # the floor manager's two commitments per job (R49), scored at close (R48, R52)
 SEEN_KEEP = arbiter.SEEN_KEEP
 REF = re.compile(r"^ref:\s*fm-wave-(?P<w>[A-Za-z0-9_.-]+?)-job(?P<n>\d+)(?:-[A-Za-z0-9_.-]*)?\s*$", re.I | re.M)  # a suffix (`-pr`) names the same job
+ET = ZoneInfo("America/New_York")
+ET_TIME = re.compile(r"^(?:(?P<mo>\d{1,2})-(?P<d>\d{1,2})\s+)?(?P<h>\d{1,2}):(?P<mi>\d{2})\s*ET$", re.I)
+FM_CMD = re.compile(r"^\s*fm-cmd:\s*(?P<cmd>.*?)\s*$", re.I | re.M)
 GH_LINK = re.compile(r"https://github\.com/(?P<repo>[\w.-]+/[\w.-]+)/(?P<kind>pull|issues)/(?P<n>\d+)")
 
 
@@ -68,14 +72,29 @@ def wave_key(thread: str) -> str: return f"wave:{thread}"
 def job_thread(thread: str, n: int) -> str: return f"{thread}:job{n}"
 
 
-def parse_time(value) -> float | None:
-    """Epoch seconds, or ISO 8601 (`2026-10-12T02:20:00Z`, naive is UTC); None stays None. Times are stored as floats like `Round.due`."""
+def parse_time(value, now: float | None = None) -> float | None:
+    """Epoch seconds, ISO 8601 (`2026-10-12T02:20:00Z`, naive is UTC), or `MM-DD HH:MM ET` and a bare `HH:MM ET`, each its
+    next occurrence after `now` (#83): a passed date is next year's, a passed time tomorrow's. None stays None. Times are stored as floats like `Round.due`."""
     if value is None or value == "": return None
     if isinstance(value, (int, float)): return float(value)
     s = str(value).strip()
     try: return float(s)
     except ValueError: pass
-    d = datetime.fromisoformat(s.replace("Z", "+00:00"))
+    m = ET_TIME.match(s)
+    if m:
+        if now is None: raise WaveError(f"{s!r} is relative to now; no clock was given")
+        base = datetime.fromtimestamp(float(now), ET)
+        md = (int(m.group("mo")), int(m.group("d"))) if m.group("mo") else (base.month, base.day)
+        try: t = base.replace(month=md[0], day=md[1], hour=int(m.group("h")), minute=int(m.group("mi")), second=0, microsecond=0)
+        except ValueError as e: raise WaveError(f"{s!r}: {e}") from e
+        if t.timestamp() <= float(now):  # already past: a bare time is tomorrow's, a dated one next year's
+            if not m.group("mo"): t = datetime.combine(t.date() + timedelta(days=1), t.time(), ET)
+            else:
+                try: t = datetime.combine(t.date().replace(year=t.year + 1), t.time(), ET)
+                except ValueError as e: raise WaveError(f"{s!r}: {e}") from e
+        return t.timestamp()
+    try: d = datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except ValueError as e: raise WaveError(f"{s!r} is not a time: epoch, ISO, `HH:MM ET` or `MM-DD HH:MM ET`") from e
     return (d if d.tzinfo else d.replace(tzinfo=timezone.utc)).timestamp()
 
 
@@ -167,8 +186,9 @@ class Wave:
 
 
 # -- opening (driver-only) --------------------------------------------------------------
-def parse_job(spec: str) -> dict:
-    """`issue=69;files=src/a.py,tests/;implementer=U1:login1;auditor=U2:login2;input_at=…;pr_eta=…;review_eta=…;config_change=no` -> a Job's fields."""
+def parse_job(spec: str, now: float | None = None) -> dict:
+    """`issue=69;files=src/a.py,tests/;implementer=U1:login1;auditor=U2:login2;input_at=…;pr_eta=…;review_eta=…;config_change=no` -> a Job's fields.
+    Without `now`, an ET time (`15:05 ET`, `10-13 09:00 ET`) stays text and `build_job` reads it against the opening's `now`."""
     out: dict = {}
     for part in str(spec).split(";"):
         if not part.strip(): continue
@@ -182,7 +202,7 @@ def parse_job(spec: str) -> dict:
             slack, _, login = value.partition(":")
             out[key] = {"slack": slack.strip(), "login": login.strip()}
         elif key == "config_change": out[key] = value.lower() in ("1", "true", "yes", "y")
-        elif key in ("input_at", *ETAS): out[key] = parse_time(value)
+        elif key in ("input_at", *ETAS): out[key] = value if now is None and ET_TIME.match(value) else parse_time(value, now)
         else: out[key] = value
     return out
 
@@ -223,8 +243,8 @@ def load_register(cfg: Config) -> register_mod.Register | None:
 def build_job(n: int, spec: dict, repo: str, now: float, cfg: Config, reg: register_mod.Register | None) -> Job:
     spec = {k: v for k, v in spec.items() if not (k == "repo" and not str(v or "").strip())}  # an empty `repo=` is unset: the wave's repo
     j = Job.from_dict({**{"repo": repo or ""}, **spec})
-    j.input_at = parse_time(j.input_at) if j.input_at is not None else now
-    j.pr_eta, j.review_eta = parse_time(j.pr_eta), parse_time(j.review_eta)
+    j.input_at = parse_time(j.input_at, now) if j.input_at is not None else now
+    j.pr_eta, j.review_eta = parse_time(j.pr_eta, now), parse_time(j.review_eta, now)
     check_job(n, j, cfg.owner)
     check_register(n, j, reg)
     j.files = [norm_path(f) for f in j.files]
@@ -299,17 +319,99 @@ def bind_pr(wave: Wave, n: int, pr: int, *, head: str = "", now: float) -> Wave:
     return w
 
 
-def set_eta(wave: Wave, n: int, *, pr_eta=None, review_eta=None) -> Wave:
+def set_eta(wave: Wave, n: int, *, pr_eta=None, review_eta=None, now: float | None = None) -> Wave:
     """The floor manager's re-estimate: the current ETA changes, `first_etas` stays and is what `close()` scores (R49)."""
     if pr_eta is None and review_eta is None: raise WaveError("give a new pr_eta, review_eta or both")
     w = copy.deepcopy(wave)
     j = editable(w, n)
     j.first_etas = {name: j.first_eta(name) for name in ETAS}
-    if pr_eta is not None: j.pr_eta = parse_time(pr_eta)
-    if review_eta is not None: j.review_eta = parse_time(review_eta)
+    if pr_eta is not None: j.pr_eta = parse_time(pr_eta, now)
+    if review_eta is not None: j.review_eta = parse_time(review_eta, now)
+    retime(j)
+    return w
+
+
+def retime(j: Job):
     j.round["etas"] = round_etas(j)  # the round's due follows the re-estimate (#89)
     if j.round.get("stage") in j.round["etas"]: j.round["due"] = j.round["etas"][j.round["stage"]]
+
+
+ROLE_ETA = {"implementer": "pr_eta", "auditor": "review_eta"}
+
+
+def reassign(wave: Wave, n: int, role: str, person: dict, new_eta, *, now: float, cfg: Config) -> Wave:
+    """#83: the role moves to `person` ({slack, login}) and `new_eta` becomes the role's re-estimate; `first_etas` is kept for scoring (R52).
+    Refuses the owner, the person who already holds the role and the job's other role. The ladder's ids carry the holder and ETA, so its rungs
+    start again for the new holder; the old holder is released by no longer being on the roster."""
+    if role not in ROLES: raise WaveError(f"role must be one of {', '.join(ROLES)}, got {role!r}")
+    w = copy.deepcopy(wave)
+    j = editable(w, n)
+    p = {"slack": str((person or {}).get("slack") or "").strip(), "login": str((person or {}).get("login") or "").strip()}
+    if not arbiter.SLACK_ID.match(p["slack"]): raise WaveError(f"job {n}: {role} needs a Slack user id (U… or W…), got {p['slack']!r}")
+    if not p["login"]: raise WaveError(f"job {n}: {role} needs a GitHub login (slack:login)")
+    if p["slack"] == cfg.owner: raise WaveError(f"job {n} (#{j.issue}): the owner {cfg.owner} cannot hold {role}")
+    cur, other = j.person(role), j.person(ROLES[1 - ROLES.index(role)])
+    if p["slack"] == cur.get("slack") or p["login"].lower() == str(cur.get("login") or "").lower():
+        raise WaveError(f"job {n} (#{j.issue}): {p['slack']} ({p['login']}) already holds {role}")
+    if p["slack"] == other.get("slack") or p["login"].lower() == str(other.get("login") or "").lower():
+        raise WaveError(f"job {n} (#{j.issue}): {p['slack']} ({p['login']}) holds the other role; a job's auditor is another person (R53)")
+    t = parse_time(new_eta, now)
+    if t is None: raise WaveError(f"job {n}: reassign needs a new ETA (R49)")
+    check_register(n, Job.from_dict({**j.to_dict(), role: p}), load_register(cfg))
+    j.first_etas = {name: j.first_eta(name) for name in ETAS}
+    setattr(j, role, p)
+    setattr(j, ROLE_ETA[role], t)
+    j.round["roster"] = {**(j.round.get("roster") or {}), role: {**((j.round.get("roster") or {}).get(role) or {}), "holders": [p["slack"]], "login": p["login"]}}
+    retime(j)
     return w
+
+
+# -- fm-cmd lines (#93): the owner's typed commands, one per line ------------------------
+def job_number(token: str) -> int:
+    m = re.fullmatch(r"(?:job)?(\d+)", str(token).strip(), re.I)
+    if not m: raise WaveError(f"{token!r} is not a job (jobN)")
+    return int(m.group(1))
+
+
+def command(w: Wave, line: str, now: float, cfg: Config) -> tuple[Wave, list[Action]]:
+    """`reassign jobN implementer|auditor Uslack:login <eta>`, `eta jobN pr|review <eta>`, `drop jobN <reason>`, `bind-pr jobN <pr> [head]`."""
+    words = line.split()
+    if not words: raise WaveError("empty command")
+    verb, args = words[0].lower(), words[1:]
+    if verb == "reassign":
+        if len(args) < 4: raise WaveError("usage: reassign jobN implementer|auditor Uslack:login <eta>")
+        slack, _, login = args[2].partition(":")
+        return reassign(w, job_number(args[0]), args[1].lower(), {"slack": slack, "login": login}, " ".join(args[3:]), now=now, cfg=cfg), []
+    if verb == "eta":
+        if len(args) < 3 or args[1].lower() not in ("pr", "review"): raise WaveError("usage: eta jobN pr|review <eta>")
+        return set_eta(w, job_number(args[0]), **{f"{args[1].lower()}_eta": " ".join(args[2:])}, now=now), []
+    if verb == "drop":
+        if len(args) < 2: raise WaveError("usage: drop jobN <reason>")
+        return drop_job(w, job_number(args[0]), " ".join(args[1:]), now=now)
+    if verb == "bind-pr":
+        if len(args) not in (2, 3) or not args[1].lstrip("#").isdigit(): raise WaveError("usage: bind-pr jobN <pr> [head]")
+        return bind_pr(w, job_number(args[0]), int(args[1].lstrip("#")), head=args[2] if len(args) == 3 else "", now=now), []
+    raise WaveError(f"unknown command {verb!r}; one of reassign, eta, drop, bind-pr")
+
+
+def commands(w: Wave, ev: Event, ts: str, cfg: Config) -> tuple[Wave, list[Action]]:
+    """Each `fm-cmd:` line applied on its own; a failed line leaves the wave as it was. At most one reply per post, listing the failures."""
+    out: list[Action] = []
+    failed: list[str] = []
+    for m in FM_CMD.finditer(str(ev.get("text") or "")):
+        try: w, acts = command(w, m.group("cmd"), ev.now, cfg)
+        except WaveError as e:
+            failed.append(f"`fm-cmd: {m.group('cmd')}`: {e}")
+            continue
+        out += acts
+    if failed:
+        ref = f"{w.thread}/wave/fm-cmd/{ts or int(ev.now)}"
+        if not any(p.get("id") == ref for p in w.pending):
+            a = Action("post", ref, {"thread": w.thread, "post_kind": "report", "text": "\n".join([
+                f"{len(failed)} fm-cmd line{'s' if len(failed) > 1 else ''} not applied:", *(f"• {f}" for f in failed), f"ref: {ref}"])})
+            w.pending = w.pending + [a.to_dict()]
+            out.append(a)
+    return w, out
 
 
 def drop_job(wave: Wave, n: int, reason: str, *, now: float) -> tuple[Wave, list[Action]]:
@@ -386,6 +488,7 @@ def observe(wave: Wave, ev: Event, cfg: Config) -> tuple[Wave, list[Action]]:
     if ev.kind == "crew_post":
         if ts and ts in w.seen: return w, []
         if ts: w.seen = (w.seen + [ts])[-SEEN_KEEP:]
+        if str(ev.get("sender") or "") == cfg.owner and FM_CMD.search(str(ev.get("text") or "")): return commands(w, ev, ts, cfg)  # #93: owner only
         if str(ev.get("sender") or "") == cfg.owner and not REF.search(str(ev.get("text") or "")): return w, []  # the arbiter's own posts, and the floor manager's prose
     j, why = route(w, ev)
     if j is None:
