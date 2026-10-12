@@ -9,6 +9,11 @@ read is posted as `unreadable` and stored as None (NULL), never estimated. A res
 time in ET (America/New_York, so EDT or EST as the date has it); it resolves to its next
 occurrence after `reported_at` (on the named weekday when one is given) and is stored as UTC.
 No LLM: a line that names a field but does not parse raises `WorkloadError`.
+
+`intake` reads a thread's posts into rows: the Innie is the register's entry for the post's
+Slack sender, `reported_at` is the post's own `ts`, and `source` is `<thread>/<ts>` (a post's own
+`thread` overrides the argument). A post that carries no report line is chat and is passed
+over; a report that cannot be read becomes a finding, a dict `{source, sender, reason}`.
 """
 from __future__ import annotations
 
@@ -95,3 +100,34 @@ def parse(text: str, reported_at: datetime) -> Report:
         fields["session_usage"], fields["session_reset"] = _usage("session", parts[1], reported_at)
         fields["weekly_usage"], fields["weekly_reset"] = _usage("weekly", parts[2], reported_at)
     return Report(**fields)
+
+
+def is_report(text: str) -> bool:
+    """Whether a post carries a report line (`slots:`, `session:` or `weekly:`); anything else is chat."""
+    return any(re.match(r"slots:", ln.strip().strip("`").strip(), re.I) or re.search(r"\b(session|weekly):", ln, re.I) for ln in str(text).splitlines())
+
+
+def intake(posts, register, now: datetime, thread: str = "") -> tuple[list[dict], list[dict]]:
+    """A thread's posts as `(rows, findings)`. Each row is `parse(...).row(innie)` plus its `source`, ready for `ledger.ingest`.
+
+    A post is a mapping with `sender` (Slack id), `text`, `ts` (Slack ts, epoch seconds) and an
+    optional `thread` that overrides the argument. A report whose sender the register does not
+    list, whose `ts` is unreadable or later than `now` (aware), or whose lines do not parse is a
+    finding `{source, sender, reason}`, never a row."""
+    if now.tzinfo is None: raise ValueError("now must be timezone-aware")
+    rows: list[dict] = []
+    findings: list[dict] = []
+    for post in posts:
+        text, sender, ts = str(post.get("text") or ""), str(post.get("sender") or ""), str(post.get("ts") or "")
+        if not is_report(text): continue
+        source = f"{post.get('thread') or thread}/{ts}"
+        def finding(reason: str) -> None: findings.append({"source": source, "sender": sender, "reason": reason})
+        innie = register.by_slack(sender) if register is not None else None
+        if innie is None: finding(f"sender {sender or '(none)'} is not in the register"); continue
+        try: at = datetime.fromtimestamp(float(ts), timezone.utc)
+        except (TypeError, ValueError, OverflowError): finding(f"unreadable ts {ts!r}"); continue
+        if at > now: finding(f"posted at {utc(at)}, after now ({utc(now)})"); continue
+        try: report = parse(text, at)
+        except WorkloadError as e: finding(str(e)); continue
+        rows.append({**report.row(innie.name), "source": source})
+    return rows, findings
