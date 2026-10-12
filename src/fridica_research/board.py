@@ -77,6 +77,10 @@ class MissingField(KeyError):
     pass
 
 
+class LoginLookupFailed(RuntimeError):
+    """`gh api user` failed or printed no login (#72): the comment step skips this pass and retries on the next."""
+
+
 def subprocess_runner(token_env: str) -> Runner:
     def run(argv: list[str], stdin: str | None = None) -> str:
         env = dict(os.environ)
@@ -217,7 +221,13 @@ class Projects:
 
     def login(self) -> str:
         """The token's own account (`gh api user`), read once: the author of every comment the driver posts."""
-        if not getattr(self, "_login", None): self._login = json.loads(self.run(["gh", "api", "user"], None))["login"]
+        if not getattr(self, "_login", None):
+            try:
+                login = json.loads(self.run(["gh", "api", "user"], None))["login"]
+            except Exception as e:  # noqa: BLE001 - any gh or parse failure is the one typed error; nothing is cached
+                raise LoginLookupFailed(f"gh api user failed: {e}") from e
+            if not login: raise LoginLookupFailed("gh api user printed no login")
+            self._login = login
         return self._login
 
     def find_comment(self, number: int, marker: str) -> int | None:
@@ -273,6 +283,7 @@ class Board:
         self.cfg, self.b = cfg, cfg.board
         self.api = Projects(cfg, runner, remember, recall)
         self.remember, self.recall = remember, recall
+        self.findings: list[str] = []  # this sync's new findings, returned by `sync`
 
     def login(self, slack_id: str, state: State) -> str: return self.cfg.login_of(slack_id, state.people)
     def title(self, state: State) -> str: return state.problem.strip().splitlines()[0][:80] if state.problem.strip() else state.thread
@@ -282,7 +293,7 @@ class Board:
         if not self.b.enabled: return []
         key = f"board:{state.thread}"
         cards = json.loads(self.recall(key) or "{}") or {"stages": []}
-        findings = []
+        findings = self.findings = []
         try:
             self.api.field_setup_failed = False
             try:
@@ -354,6 +365,18 @@ class Board:
         return head + "\n\n" + stage_table(state) + self.notes(state, cards)
 
     def sync_comment(self, state: State, n: int, cards: dict):
+        """#72: a failed `gh api user` lookup skips the comment step for this pass with one finding (deduplicated like
+        `field_setup_finding`); the rest of the sync goes on and the next pass retries."""
+        try:
+            self._sync_comment(state, n, cards)
+        except LoginLookupFailed as error:
+            log.warning("board comment step skipped for %s: %s", state.thread, error)
+            if not cards.get("login_lookup_finding"):
+                finding = "Board adoption comment skipped: the driver's GitHub login lookup (gh api user) failed; retried on the next sync."
+                cards["login_lookup_finding"] = finding
+                self.findings.append(finding)
+
+    def _sync_comment(self, state: State, n: int, cards: dict):
         """Post the adoption comment once, store its id, PATCH it when the text changes. A legacy card (`commented`, no id)
         and a PATCH that 404s (the comment was deleted) look the driver's own marker comment up; a new comment is posted
         only when none is found."""
@@ -376,9 +399,13 @@ class Board:
                 cards["comment_sha"] = digest
                 return
         if cards.get("comment_id") is None:
+            self.api.login()  # the lookup a post without an id needs: a failure here skips the pass before anything is posted
             cid = self.api.comment_issue(n, text)
-            cards["commented"], cards["comment_id"], cards["comment_sha"] = True, cid if cid is not None else self.api.find_comment(n, self.adoption_marker(state)), digest
-            self.remember(f"board:{state.thread}", json.dumps(cards))  # recorded at once: a later failure in this sync must not lose the id
+            cards["commented"], cards["comment_id"], cards["comment_sha"] = True, cid, digest
+            self.remember(f"board:{state.thread}", json.dumps(cards))  # recorded at once, before any lookup: a failure after the post never repeats it
+            if cid is None:
+                cards["comment_id"] = self.api.find_comment(n, self.adoption_marker(state))
+                self.remember(f"board:{state.thread}", json.dumps(cards))
 
     def sync_study(self, state: State, cards: dict):
         owner_login = self.login(self.cfg.owner, state)
