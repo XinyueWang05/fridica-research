@@ -46,7 +46,7 @@ class FakeGh:
     `gh pr view` answers only the requested `--json` fields, `latestReviews` in its real shape (empty id and oid)."""
 
     def __init__(self, *prs: tuple[str, dict]):
-        self.prs = {contracts.pr_id(url): {"reviews": [], "headRefOid": HEAD, "state": "OPEN", "mergedAt": None, "mergeCommit": None, "author": {"login": "implementer"}, "milestone": None, "isDraft": False, **v} for url, v in prs}
+        self.prs = {contracts.pr_id(url): {"reviews": [], "headRefOid": HEAD, "state": "OPEN", "mergedAt": None, "mergeCommit": None, "author": {"login": "implementer"}, "milestone": None, "isDraft": False, "mergeable": "MERGEABLE", "statusCheckRollup": [], **v} for url, v in prs}
         self.calls: list[tuple[list[str], dict | None]] = []
         self.milestones: dict[str, list[dict]] = {}
         self.opened: dict[str, str] = {}  # head branch -> PR url
