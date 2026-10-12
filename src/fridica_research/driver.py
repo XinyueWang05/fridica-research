@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import subprocess
 import time
 from typing import Callable
@@ -24,6 +25,7 @@ from .store import Store
 log = logging.getLogger("fridica_research.driver")
 LlmRunner = Callable[[str, str], dict]  # (schema name, prompt) -> payload
 ETA_FIELD = "ETA"  # the board text field a wave job's `dates["eta_text"]` goes to (#110); `Board.set_dates` takes dates only
+NOT_FOUND = re.compile(r"could not resolve to a pullrequest|no pull requests? found|not found|http 404", re.I)  # gh's answers for a PR number that is not a PR
 GH_FAILING_PASSES = 3  # consecutive wave polling passes with a failed GitHub read before the owner is told (#85)
 
 
@@ -359,11 +361,16 @@ class Driver:
                 now = self.clock()
                 if now < self.last_poll.get((thread, n), float("-inf")) + self.cfg.github.poll_interval: continue
                 self.last_poll[(thread, n)], reads = now, reads + 1
+                had = rnd.pr.get("candidate")
                 try: ev = self.read_pr(rnd, run)
                 except Exception as e:  # noqa: BLE001 - a GitHub read never stalls a wave; the next pass reads again
                     log.warning("pr read for wave %s job %d failed: %s", thread, n, e)
                     error = error or e
                     continue
+                cur = w.jobs[n - 1].round.get("pr") or {}  # `w` is the latest fold, not the wave this loop started from
+                if had and "candidate" not in rnd.pr and cur.get("candidate") == had:  # read_pr dropped a not-found candidate
+                    cur.pop("candidate")
+                    self.save_wave(w)
                 if ev is None: continue
                 view = ev.get("view") or {}
                 if view.get("state") == "MERGED":
@@ -550,9 +557,14 @@ class Driver:
         now = self.clock()
         if not rnd.pr.get("number") and rnd.pr.get("candidate"):  # job 4's candidate may be another author's PR: `list_prs --author` would miss it
             n = int(rnd.pr["candidate"])  # the adoption fields (`LIST_FIELDS`: number, author, body, ...): `view_pr` reads no body
-            view = json.loads(run(["gh", "pr", "view", str(n), "-R", rnd.repo, "--json", github.LIST_FIELDS], None) or "{}")
-            view.setdefault("number", n)
-            return Event("pr_polled", now, {"prs": [view]})
+            try:
+                view = json.loads(run(["gh", "pr", "view", str(n), "-R", rnd.repo, "--json", github.LIST_FIELDS], None) or "{}")
+                view.setdefault("number", n)
+                return Event("pr_polled", now, {"prs": [view]})
+            except Exception as e:  # noqa: BLE001 - a bad candidate never blocks adoption: the author listing below runs this pass
+                gone = bool(NOT_FOUND.search(str(e)))
+                log.warning("candidate PR #%s for %s %s: %s", n, rnd.thread, "not found, dropped" if gone else "view failed", e)
+                if gone: rnd.pr.pop("candidate", None)  # the caller saves the drop
         if not rnd.pr.get("number"):
             me = rnd.login("implementer", self.cfg)
             if not me: return None  # whose PR is "own" is unknown: nothing to adopt

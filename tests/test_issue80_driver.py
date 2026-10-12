@@ -187,3 +187,53 @@ def test_dates_without_eta_text_write_no_eta_field(tmp_path):
     api, drv = board_driver(tmp_path)
     drv.board_fields(wave_board_action(eta_text=False))
     assert [w for w in api.writes if w[0] == "text"] == [] and ("dates", 69, "2026-10-12", "2026-10-12", None) in api.writes
+
+
+# -- Xi's finding on 1ddd7d7: a candidate whose view fails must not block adoption ------------------------------------
+class FailingCandidateGh(CandidateGh):
+    """CandidateGh where viewing a PR it does not have fails as gh does; `view_error` replaces that message when set."""
+
+    def __init__(self):
+        super().__init__()
+        self.view_error = ""
+
+    def run(self, argv, stdin):
+        if argv[:3] == ["gh", "pr", "view"] and int(argv[3]) not in self.prs:
+            self.calls.append(argv)
+            raise RuntimeError(self.view_error or f"GraphQL: Could not resolve to a PullRequest with the number of {argv[3]}. (repository.pullRequest)")
+        return super().run(argv, stdin)
+
+
+def failing_candidate_world(tmp_path, view_error: str = ""):
+    store, client, _, clock, _ = ladder_world(tmp_path)
+    gh = FailingCandidateGh()
+    gh.view_error = view_error
+    gh.prs = {71: {"author": "imp1", "issue": 69, "state": "OPEN", "head": HEAD}, 72: {"author": "imp2", "issue": 54, "state": "OPEN", "head": HEAD},
+              73: {"author": "imp3", "issue": 61, "state": "OPEN", "head": HEAD}}
+    w = stored(store)
+    w.jobs[2].round.setdefault("pr", {})["candidate"] = 999
+    store.set_meta(wave.wave_key(THREAD), w.to_json())
+    return store, client, gh, clock, make(store, client, gh, clock)
+
+
+def author_listings(gh, login: str) -> int: return sum(1 for a in gh.calls if a[:3] == ["gh", "pr", "list"] and "--author" in a and login in a)
+
+
+def test_a_missing_candidate_is_dropped_and_the_implementers_pr_adopted(tmp_path, caplog):
+    store, client, gh, clock, drv = failing_candidate_world(tmp_path)
+    for _ in range(4):
+        drv.run_once()
+        clock.t += H
+    pr = stored(store).jobs[2].rnd().pr
+    assert pr.get("number") == 73 and "candidate" not in pr and author_listings(gh, "imp3") >= 1
+    assert sum(1 for a in gh.calls if a[:4] == ["gh", "pr", "view", "999"]) == 1  # dropped after the first not-found
+    assert drv.gh_failures.get(THREAD) is None and not any("GitHub reads failing" in t for _, t in client.posts)
+    assert "candidate" in caplog.text and "999" in caplog.text
+
+
+def test_another_candidate_error_is_logged_and_list_prs_runs_that_pass(tmp_path, caplog):
+    store, client, gh, clock, drv = failing_candidate_world(tmp_path, view_error="HTTP 502: Bad Gateway")
+    drv.run_once()
+    pr = stored(store).jobs[2].rnd().pr
+    assert author_listings(gh, "imp3") == 1 and pr.get("number") == 73
+    assert "HTTP 502" in caplog.text and "999" in caplog.text
