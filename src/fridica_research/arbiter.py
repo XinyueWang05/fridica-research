@@ -44,7 +44,7 @@ import json
 import re
 from dataclasses import dataclass, field
 
-from . import contracts
+from . import contracts, register as register_mod
 from .config import Config
 from .github import latest_verdicts
 from .machine import Action, Event
@@ -159,8 +159,10 @@ class Round:
 
 
 # -- adoption (driver-only) -------------------------------------------------------------
-def parse_roster(roles: list[str], logins: list[str], delegate: list[str], owner: str) -> dict[str, dict]:
-    """`explorer=U1,U2` pairs into the roster, with `delegate` refused on every person-held role (R47.1)."""
+def parse_roster(roles: list[str], logins: list[str], delegate: list[str], owner: str, register: register_mod.Register | None = None) -> dict[str, dict]:
+    """`explorer=U1,U2` pairs into the roster, with `delegate` refused on every person-held role (R47.1).
+
+    With a register (#54, R48) every holder's Slack id and every `--login` must be registered: the register is the roster's single source."""
     roster: dict[str, dict] = {}
     for item in roles or []:
         role, _, ids = str(item).partition("=")
@@ -171,10 +173,12 @@ def parse_roster(roles: list[str], logins: list[str], delegate: list[str], owner
         for h in holders:
             if not SLACK_ID.match(h): raise RosterError(f"{h!r} is not a Slack user id (U… or W…)")
             if h == owner: raise RosterError(f"the owner {owner} cannot hold {role}: the roster lists the crew, and the owner is escalated to, not assigned")
+            if register is not None and register.by_slack(h) is None: raise RosterError(f"{h} is not in the register ({register.path or 'no path'}); add an [innie.<name>] with slack = \"{h}\" before adopting")
         roster.setdefault(role, {"holders": [], "login": "", "delegate": False})["holders"] += holders
     for item in logins or []:
         role, _, login = str(item).partition("=")
         if role.strip() not in roster: raise RosterError(f"--login {item}: {role.strip()!r} is not in the roster")
+        if register is not None and register.by_login(login.strip()) is None: raise RosterError(f"--login {item}: {login.strip()!r} is not in the register ({register.path or 'no path'})")
         roster[role.strip()]["login"] = login.strip()
     for role in delegate or []:
         held = ", ".join(roster.get(role, {}).get("holders") or [])
@@ -219,7 +223,7 @@ def adopt(thread: str, *, issue: int | None, repo: str, roles: list[str], logins
     Adoption writes no board field and posts nothing: the first clearance does that."""
     if len(str(thread).split(":")) != 3: raise RosterError(f"{thread!r} is not a thread id (workspace:channel:root_ts)")
     if stage not in ORDER: raise RosterError(f"unknown stage {stage!r}; stages are {', '.join(ORDER)}")
-    roster = parse_roster(roles, logins or [], delegate or [], cfg.owner)
+    roster = parse_roster(roles, logins or [], delegate or [], cfg.owner, register_mod.load_for(cfg))  # a register path that is set but missing raises here
     if not roster: raise RosterError("a round needs a roster: --role explorer=U… --role debater=U… …")
     if not roster.get(ROUND_ROLE[stage], {}).get("holders"): raise RosterError(f"stage {stage} needs a {ROUND_ROLE[stage]}: --role {ROUND_ROLE[stage]}=U…")
     rnd = Round(thread=thread, channel=str(thread).split(":")[1], issue=int(issue) if issue else None, repo=repo or "",
