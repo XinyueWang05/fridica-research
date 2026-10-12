@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
+import inspect
 import json
 import logging
 import sys
 import time
 from dataclasses import asdict
+from pathlib import Path
 
-from . import arbiter, config, contracts, ledger, provenance, wave
-from .board import Board, Projects, role_totals
+from . import arbiter, config, contracts, ledger, provenance, shadow, wave
+from .board import Board, Projects, role_totals, subprocess_runner
 from .client import Client, read_capability
 from .driver import Driver, claude_runner
 from .github import GitHub, MilestoneMissing, PrHygieneError
@@ -104,9 +107,21 @@ def cmd_command(cfg: config.Config, args, cmd: str) -> int:
     return 0
 
 
+def now_kw(fn, now: float) -> dict:
+    """Ruling 4: the CLI's clock goes to `fn` as `now`, when `fn` takes it (the wave.py side is #108)."""
+    return {"now": now} if "now" in inspect.signature(fn).parameters else {}
+
+
 def cmd_serve(cfg: config.Config, args) -> int:
-    """#93: one serve per state file (`<state>.lock` holds the pid), and the store is closed on every exit, refusal or not."""
+    """#93: one serve per state file (`<state>.lock` holds the pid), and the store is closed on every exit, refusal or not.
+    #106: `--dry-run` serves its own state file (`--state`, default `<state_file>.dry-run`, never seeded from the real one)
+    with every write going to `<state_file>.dry-run.jsonl` through `shadow`; the lock covers that state file only."""
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
+    sink = None
+    if getattr(args, "dry_run", False):
+        real_state = Path(config.load(args.config).state_file) if getattr(args, "state", None) else cfg.state_file
+        sink = shadow.Sink(f"{real_state}.dry-run.jsonl")
+        if not getattr(args, "state", None): cfg = dataclasses.replace(cfg, state_path=f"{cfg.state_file}.dry-run")
     store = Store(cfg.state_file)
     try:
         with store.lock():
@@ -115,9 +130,11 @@ def cmd_serve(cfg: config.Config, args) -> int:
                 if stuck:
                     print(f"open wave(s) {', '.join(stuck)} but [github] and [board] are both off: no PR or merge would ever be seen; enable [github] or close the wave", file=sys.stderr)
                     return 1
-            board = Board(cfg, remember=store.set_meta, recall=store.get_meta) if cfg.board.enabled else None
-            github = GitHub(cfg, remember=store.set_meta, recall=store.get_meta) if cfg.github.enabled else None
-            Driver(cfg, build_client(cfg), store, llm=claude_runner(cfg.llm_model), board=board, github=github).serve(once=args.once)
+            gate = (lambda env: shadow.runner(subprocess_runner(env), sink)) if sink is not None else (lambda env: None)
+            board = Board(cfg, runner=gate(cfg.board.token_env), remember=store.set_meta, recall=store.get_meta) if cfg.board.enabled else None
+            github = GitHub(cfg, runner=gate(cfg.github.token_env), remember=store.set_meta, recall=store.get_meta) if cfg.github.enabled else None
+            client = build_client(cfg) if sink is None else shadow.ShadowClient(build_client(cfg), sink, owner=cfg.owner)
+            Driver(cfg, client, store, llm=claude_runner(cfg.llm_model), board=board, github=github).serve(once=args.once)
             return 0
     except LockHeld as e:
         print(str(e), file=sys.stderr)
@@ -180,7 +197,7 @@ def cmd_wave(cfg: config.Config, args) -> int:
                     elif args.wave_cmd == "add-job": w = wave.add_job(w, wave.parse_job(args.job), now=now, cfg=cfg)
                     elif args.wave_cmd == "bind-pr": w = wave.bind_pr(w, args.job, args.pr, head=args.head, now=now)
                     elif args.wave_cmd == "close": w = close_wave(w, args.reason, now=now)
-                    else: w = wave.set_eta(w, args.job, pr_eta=args.pr_eta, review_eta=args.review_eta)
+                    else: w = wave.set_eta(w, args.job, pr_eta=args.pr_eta, review_eta=args.review_eta, **now_kw(wave.set_eta, now))
                 except (wave.WaveError, ValueError) as e:
                     print(str(e), file=sys.stderr)
                     return 1
@@ -263,6 +280,8 @@ def parser() -> argparse.ArgumentParser:
     pr.add_argument("--milestone", default=None, help="an existing milestone title (R<n>) overriding the adopted issue's or the generation's; never created")
     v = sub.add_parser("serve", help="run the driver loop")
     v.add_argument("--once", action="store_true", help="one pass over the feed, then exit")
+    v.add_argument("--dry-run", action="store_true", help="shadow mode (#106): reads stay real, every write goes to <state_file>.dry-run.jsonl")
+    v.add_argument("--state", default=None, help="the state file to serve (with --dry-run, default <state_file>.dry-run; never seeded from the real one)")
     r = sub.add_parser("replay", help="fold a replay corpus (or every corpus under a directory) through the machine and compare (R19)")
     r.add_argument("path", help="a corpus directory or a parent such as tests/bootstrap")
     r.add_argument("--strict", action="store_true", help="textual differences (D1) fail too")
@@ -302,6 +321,8 @@ def parser() -> argparse.ArgumentParser:
     wc = wsub.add_parser("close", help="close a wave whose jobs are all merged or dropped; refused while a job is open or the wave is already closed (#93)")
     wc.add_argument("thread")
     wc.add_argument("--reason", required=True, help="why the wave is closed by hand; recorded as a wave finding")
+    for w in (wo, ws, wd, wa, wb, we, wc):
+        w.add_argument("--state", default=None, help="the state file holding the wave (e.g. a shadow store for serve --dry-run, #106)")
     return p
 
 
@@ -340,6 +361,7 @@ def main(argv: list[str] | None = None) -> int:
             print(role + (" (lenses: " + ", ".join(LENSES) + ")" if role == "debater" else ""))
         return 0
     cfg = config.load(args.config)
+    if getattr(args, "state", None): cfg = dataclasses.replace(cfg, state_path=str(args.state))
     if args.cmd == "start": return cmd_start(cfg, args)
     if args.cmd == "adopt": return cmd_adopt(cfg, args)
     if args.cmd == "list": return cmd_list(cfg, args)
