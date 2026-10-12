@@ -27,15 +27,15 @@ Reject or defer work outside the scope of the problem.
 ## Authority and independence
 
 1. Exactly one assigned reviewer, the auditor, holds the PR's audit authority. Audit only your
-   assigned scope; the PR's role-assigning owner (the person who assigns its persistent roles)
-   may reassign a stalled audit. Do not duplicate an audit.
+   assigned scope; the floor manager, who assigns the PR's persistent roles (R48), may
+   reassign a stalled audit. Do not duplicate an audit.
 2. Never review your own work. The implementer of a PR is never one of its reviewers.
 3. For a PR produced by a study lineage, the auditor belongs to the previous study generation:
    the candidate's own generation cannot approve it. An external auditor is independent of the
    candidate's author and generation. A level-3 change (core, daemon, control protocol, runtime
    authority or permission handling, git mutation, process handling) needs one; editing the
    wording of these rules alone does not change runtime authority. Check recorded ownership,
-   generation, and lineage; ask the PR's role-assigning owner to assign an external auditor if
+   generation, and lineage; ask the floor manager to assign an external auditor if
    none is recorded.
 4. Bot-stage reviews are evidence, not merge approval. The assigned auditor's SHA-bound
    sign-off in the PR root discussion thread defined in rule 25 and current-head GitHub
@@ -48,11 +48,10 @@ PRs. The first-pass implementer retains revisions and follow-ups for that PR.
 
 ## Before you start
 
-5. Post an `ETA <time>` line when you take a review. If you miss it, post a status line and a
-   new ETA in the PR root discussion thread defined in rule 25. If posting there is not
-   authorized, record it for the PR's role-assigning owner. On a missed ETA, that owner
-   reassigns the stalled audit or escalates to study owner chengcli; neither path waives the
-   current-head approval gate.
+5. The review's ETA is the floor manager's (R49); you do not set it. If you will miss it, say
+   so before it passes, in the PR root discussion thread defined in rule 25, or to the floor
+   manager if posting there is not authorized. The floor manager re-estimates or reschedules
+   (R51); neither path waives the current-head approval gate.
 6. Verify the exact head SHA and base (via `gh` and `git ls-remote`), the parent chain (no
    force-push since a recorded prior head, when one exists), and CI on that SHA. Record them.
    Current metadata alone cannot establish the absence of a historical force-push.
@@ -111,8 +110,9 @@ PRs. The first-pass implementer retains revisions and follow-ups for that PR.
     a repairable implementation problem returns without erasing its blocking finding. Post a
     **reject** verdict as a `changes` sign-off with the reason; the sign-off format has no
     `reject` value.
-24. After three completed review rounds on the same PR and assigned scope, stop and escalate
-    to study owner chengcli with a summary before a fourth. A revised head is a new round;
+24. After three completed review rounds on the same PR and assigned scope, stop and report
+    to the floor manager with a summary before a fourth. That is a judgment call, so it goes
+    to the deputy for arbitration (R54); owner-only questions go to the owner (R48). A revised head is a new round;
     repeated review on one head counts when substantive findings are delivered. Escalation
     never turns an unresolved blocker into approval.
 
@@ -126,8 +126,8 @@ PRs. The first-pass implementer retains revisions and follow-ups for that PR.
     submits that GitHub review. The driver merges only after the auditor approves the current
     head and required branch checks pass.
     If GitHub review permission is unavailable, report the technical gate as blocked to the
-    role-assigning owner for reassignment or escalation to study owner chengcli; a thread
-    sign-off alone does not clear it.
+    floor manager, who reassigns or applies R42; a judgment call it cannot settle by rule
+    goes to the deputy (R54). A thread sign-off alone does not clear it.
 26. Re-check the head immediately before signing. Any push resets your sign-off; do not sign a
     head you did not review.
 27. A review that lands after merge still counts. Route its findings to the first-pass author

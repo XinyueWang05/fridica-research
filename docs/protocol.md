@@ -14,13 +14,14 @@ Each participant holds one persistent role for that PR (explorer, debater, imple
 auditor), and assignments may rotate between PRs. The explorer reports what exists and what is
 missing. Work outside any role's jurisdiction goes into the PR root thread as input for the
 assigned role. The first-pass implementer owns revisions and is the only role that commits
-code. The PR's role-assigning owner is the person who assigns its persistent roles and may
-reassign a stalled auditor. Exactly one reviewer is assigned to the PR: its auditor. Only that
+code. The floor manager assigns its persistent roles (R48) and may reassign a stalled
+auditor. Exactly one reviewer is assigned to the PR: its auditor. Only that
 auditor submits a GitHub review, bound to the current head. The driver merges only after that
 auditor approves the current head and required branch checks pass.
 
-If the auditor misses a stated ETA, the role-assigning owner reassigns the review or escalates
-to study owner chengcli. An unresolved blocker or unavailable approval leaves the PR unmerged;
+The floor manager sets the review's ETA (R49); the auditor says so before missing it. On a
+miss the floor manager re-estimates or reschedules (R51), and judgment calls go to the
+deputy (R54). An unresolved blocker or unavailable approval leaves the PR unmerged;
 neither timeout nor escalation waives the auditor's current-head approval.
 
 Debate covers at least two distinct lenses, followed by a summary of their agreement,
@@ -48,6 +49,10 @@ to a human. Source of truth for each rule is the code named beside it.
 | auditor | assigned per study | Design audit before implementation; code audit against audited consensus |
 | implementer | assigned per study | Implement the audited consensus only; retain revisions |
 | driver and arbitrator | assigned per study | Holds no PR role; runs threads, assignments and rotation, hand-offs, board, ETAs, replay gate and merge on auditor approval under maintainer authority; arbitrates disagreements and unclear rules; escalates owner-only questions to the study owner |
+
+The rows above are generated and left as they are. Since R48 the driver and arbitrator is the
+floor manager, who sets every ETA (R49); judgment calls and arbitration go to the deputy (R54);
+owner-only questions go to Cheng.
 
 ## The pipeline
 
@@ -574,7 +579,7 @@ fridica-research adopt T1:C0123456789:1700000000.000100 --issue 46 --repo chengc
 Later slices, tracked on #46: PR adoption and polling, the ETA ladder and off-role reminders,
 merge and open the next wave (R53), and the per-role AI opt-in.
 
-## Standing rules R15–R53 (#52, absorbs #28)
+## Standing rules R15–R54 (#52, absorbs #28)
 
 The owner's standing rules from iteration 3 onward, rewritten concisely. Every rule has exactly
 one status: **in force**, **superseded by Rn** (the later rule governs; the text is kept as
@@ -626,7 +631,11 @@ enforces the rule, or the issue that will; "by hand" means the floor manager doe
   CHANGES_REQUESTED = changes, COMMENTED = finding without verdict); the Slack `SIGN-OFF` line is
   the fallback for reviewers without repository access, and each review is mirrored into the
   thread as one line. Who is requested is narrowed to the PR's auditor by R38. Enforced by:
-  `github.py`, `contracts.parse_signoff` (section R21 above).
+  `github.py`, `contracts.parse_signoff` (section R21 above). Adopted rounds and wave jobs are
+  gated on the auditor's GitHub review of the current head too (`arbiter.observe`,
+  `arbiter.approved`, `driver.poll_waves`, `wave.py`); only the one-line mirror into the thread
+  is study-only (`driver.poll_github` walks the study store), and for rounds and waves it is by
+  hand.
 - **R22. Cross-repo work is part of the protocol.** Status: in force. A study may file issues
   and submit PRs on substrate and related repositories (fridica, fridica-core, pyharp, kintera,
   snapy, ...). Each cross-repo issue carries the study thread, the board link and the exact
@@ -665,14 +674,19 @@ enforces the rule, or the issue that will; "by hand" means the floor manager doe
   driver's own AI worker takes a role a person holds only on an explicit per-role opt-in (R47.1).
   (2) Every owner instruction given during a study is a standing rule:
   recorded with `fridica-research note`, written into this document by the next PR, applied from
-  the next stage. Enforced by: (1) `arbiter.py` roster refusal,
+  the next stage. Enforced by: (1) `wave.py` refuses one person as a wave job's implementer
+  and auditor (`arbiter.py` roster refusal covers the owner and AI delegation only), by hand
+  for studies,
   (2) `note` / `machine.py` findings and this section.
   - *Decision (2026-10-11):* the former clause (2), the driver's AI budgets and the low
     watermark, is retired (Cheng's ruling in Wave C); the former clause (3) is now (2).
 - **R27. Assignment invariant.** Status: in force. A card is `In Progress` only with exactly one
   assignee, set in the same transition; if the assignee cannot be set the card stays `Todo` with
   the login in `Workers` and one line asks the repository owner for access. Every transition
-  re-checks the invariant. Enforced by: `board.py` (R13, R14 above), `arbiter.py` assignee moves.
+  re-checks the invariant. Enforced by: by hand. `board.py` opens a study card with one
+  assignee and In Progress (R13, R14 above), but has no `Todo`/`Workers` fallback when the
+  assignee cannot be set; `arbiter.board_action` moves the assignee, but the driver writes Status
+  before the assignee and only logs a failed write; wave jobs get no board write at open.
 - **R28. ETA and check-back.** Status: superseded by R49. The assignee stated the ETA and the
   driver checked back at it; now the floor manager sets the ETA (R49) and runs the ladder (R51).
 - **R29. Mentions.** Status: in force. A post that needs a person to act @-mentions exactly
@@ -691,8 +705,8 @@ enforces the rule, or the issue that will; "by hand" means the floor manager doe
   checks layer boundaries. Enforced by: Repository charters above, `roles/auditor.md`.
 - **R33. First-pass author fixes.** Status: in force. Any revision, in review or after merge,
   goes to whoever did the first pass; the card is reassigned only if that author declines or
-  misses two ETAs (then rescheduled under R51). Enforced by: `roles/implementer.md`, R24 carry
-  in `github.py`; routing by hand.
+  misses two ETAs (then rescheduled under R51). Enforced by: `roles/implementer.md` (section
+  Revisions and ETAs), R24 carry in `github.py`; routing by hand.
 - **R34. Auditor rule set v2.** Status: in force. Reuse before build (search sibling repos and
   lower layers; duplicated source of truth needs a contract decision), audit the design and not
   only the code, report the class and invariant and not only the instance, fakes match real tool
@@ -777,7 +791,7 @@ enforces the rule, or the issue that will; "by hand" means the floor manager doe
   its authority and reminds otherwise; a fully cleared PR merges at once; once the wave's last PR merges, the floor
   manager opens the next wave (R53). Enforced by: `arbiter.py`, `cli.py adopt` (section R47 above).
 
-### The floor manager (R48–R53)
+### The floor manager (R48–R54)
 
 - **R48. Floor manager, Innies and Outies.** Status: in force. The floor manager holds the
   driver and arbitrator role and holds no PR role. It divides the work into jobs, assigns each to
@@ -815,3 +829,9 @@ enforces the rule, or the issue that will; "by hand" means the floor manager doe
   the assigned auditor's GitHub review on the current head, then the floor manager merges. Each
   wave closes with its R52 record. Supersedes R35 and, with R49, R37. Enforced by: by hand;
   #46 slice 4 (merge and open the next wave).
+- **R54. Judgment calls wake the deputy.** Status: in force (owner ruling 2026-10-12). The
+  deputy is Cheng's Innie. It is woken for arbitration and judgment calls the rules do not
+  settle and rules on them; owner-only questions still go to Cheng. The deputy does not take
+  over when the floor manager is away. Who holds the floor manager role is governed by R48 and
+  stated in the wave's root message; the board has no field naming it (R51 is the ETA ladder,
+  not a naming rule). Enforced by: by hand; #80 (no driver code wakes the deputy yet).
