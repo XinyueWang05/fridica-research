@@ -11,7 +11,7 @@ import json
 
 import pytest
 
-from fridica_research import arbiter, wave
+from fridica_research import wave
 from fridica_research.machine import Event
 from support import CFG, OWNER
 
@@ -90,7 +90,7 @@ def test_open_wave_holds_three_jobs_each_wrapping_a_round_keyed_per_job():
         r = j.rnd()
         assert r.thread == f"{THREAD}:job{n}" and r.stage == "Implement" and r.order == list(wave.JOB_ORDER) and r.issue == j.issue and r.repo == REPO
         assert r.holders("implementer") == [j.implementer["slack"]] and r.login("auditor") == j.auditor["login"]
-        assert r.due == T0 + arbiter.budget(CFG, "Implement")
+        assert r.due == j.pr_eta and r.etas == {"Implement": j.pr_eta, "CodeAudit": j.review_eta}  # the FM's ETA, not the crew budget (#89)
         assert (j.pr_eta, j.review_eta, j.input_at) == (T0 + 2 * H, T0 + 4 * H, T0)  # recorded as given, never computed
     assert wave.Wave.from_json(w.to_json()).to_json() == w.to_json()
 
@@ -206,12 +206,13 @@ def test_a_merged_event_is_ground_truth_even_when_the_job_was_not_ready():
 def test_a_jobs_round_behaves_as_the_arbiters_round_and_posts_go_to_the_wave_thread():
     w = opened()
     w, actions = fold(w, [post("1", PEOPLE["imp1"], handoff("aud1", "https://example.org/x"), T0)])
-    assert actions == [] and "Implement" in w.jobs[0].rnd().held  # held until a PR is recorded, as in slice 2
+    assert "Implement" in w.jobs[0].rnd().held  # held until a PR is recorded, as in slice 2
+    assert [a["kind"] for a in actions] == ["post"] and "held: no PR" in actions[0]["text"] and actions[0]["thread"] == THREAD  # one blocking post (#92)
     w, actions = fold(w, [polled(1, T0 + H, prs=[pr(71, "imp1", 69)])])
     assert [a["kind"] for a in actions] == ["board_update"] and actions[0]["thread"] == THREAD and actions[0]["id"].startswith(f"{THREAD}:job1/round/Implement-CodeAudit/board/")
     assert w.jobs[0].rnd().stage == "CodeAudit" and w.jobs[1].rnd().stage == "Implement"
     w, actions = fold(w, [post("2", PEOPLE["imp2"], "Handing off.\nhttps://example.org/y\nDue 10-12 09:00 ET", T0 + H), polled(2, T0 + 2 * H, prs=[pr(72, "imp2", 54)])])
-    fix = [a for a in actions if a["kind"] == "post"]
+    fix = [a for a in actions if a["kind"] == "post" and "/mention/" in a["id"]]
     assert len(fix) == 1 and fix[0]["thread"] == THREAD and f"ref: {THREAD}:job2/round/Implement/mention/{PEOPLE['imp2']}" in fix[0]["text"] and f"<@{PEOPLE['aud2']}>" in fix[0]["text"]
     assert all(p["thread"] == THREAD for p in w.jobs[1].rnd().pending)
     assert all(j.rnd().misses == {} for j in w.jobs if j.issue != 54) and w.jobs[1].rnd().misses == {f"Implement/{PEOPLE['imp2']}": 1}
