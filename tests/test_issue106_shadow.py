@@ -363,3 +363,124 @@ def test_a_last_row_without_its_newline_is_kept_and_the_next_row_is_not_glued(tm
     again.record("gh", "k3", argv=["gh", "pr", "merge", "k3"])
     assert shadow.Sink(path).keys == {"k1", "k2", "k3"} and path.read_bytes().endswith(b"\n")
     assert "torn" not in caplog.text
+
+
+# -- Wave I job 3 (ref fm-wave-i-assign): thread and job on every row, shadow-report, an end-to-end dry run ----------
+def test_every_client_row_carries_thread_and_job_and_a_wake_takes_its_job_from_the_ref_line(tmp_path):
+    path = tmp_path / "s.jsonl"
+    c = shadow.ShadowClient(Real(), shadow.Sink(path), owner=OWNER)
+    c.post_message(THREAD, contracts.PostRequest("report", "checking in\nref: fm-wave-i-job2/checkin"))
+    c.instruct(THREAD, "wake up\nref: fm-wave-i-job3/escalate", "wake-abc12345")  # the client id names no job: the ref line does
+    c.set_driver(THREAD, "fridica")
+    rows = shadow.read_rows(path)
+    assert [(r["thread"], r["job"]) for r in rows] == [(THREAD, "job2"), (THREAD, "job3"), (THREAD, "")]
+
+
+def opened_wave(tmp_path, repo="o/r"):
+    from test_issue69_wave import opened
+    w = opened()
+    w.repo = repo
+    for n, j in enumerate(w.jobs, 1): j.repo, j.round = repo, {**j.round, "pr": {"number": 70 + n}}
+    return [(w.thread, w)]
+
+
+@pytest.mark.parametrize("argv,stdin,want", [
+    (["gh", "api", "-X", "POST", "repos/o/r/pulls/72/requested_reviewers", "--input", "-"], '{"reviewers":["a"]}', "job2"),  # the job's PR
+    (["gh", "pr", "merge", "73", "-R", "o/r", "--squash"], None, "job3"),
+    (["gh", "issue", "edit", "69", "-R", "o/r", "--milestone", "R2"], None, "job1"),  # the job's issue
+    (["gh", "pr", "merge", "73", "-R", "other/r"], None, ""),  # same number, another repo: never inferred across repos
+    (["gh", "api", "graphql", "--input", "-"], "mutation { updateProjectV2ItemFieldValue(input: {}) { x } }", "")])  # no number
+def test_gh_rows_get_thread_and_job_from_a_jobs_pr_or_issue_in_the_same_repo_only(tmp_path, argv, stdin, want):
+    from test_issue69_wave import THREAD as WAVE
+    sink = shadow.Sink(tmp_path / "s.jsonl")
+    shadow.runner(lambda a, s: "", sink, waves=lambda: opened_wave(tmp_path))(argv, stdin)
+    row = sink.rows[-1]
+    assert (row["thread"], row["job"]) == ((WAVE, want) if want else ("", ""))
+
+
+def test_shadow_report_groups_per_thread_and_job_in_time_order_with_no_thread_last(tmp_path, capsys):
+    t = iter(range(1791857000, 1791858000, 60))
+    path = tmp_path / "s.jsonl"
+    sink = shadow.Sink(path, clock=lambda: float(next(t)))
+    c = shadow.ShadowClient(Real(), sink, owner=OWNER)
+    run = shadow.runner(lambda a, s: "", sink)
+    c.post_message(THREAD, contracts.PostRequest("report", "job 1 checking in " + "x" * 200 + "\nref: fm-wave-i-job1/checkin"))
+    run(["gh", "api", "graphql", "--input", "-"], "mutation { updateProjectV2ItemFieldValue(input: {}) { x } }")
+    c.instruct(THREAD, "wake\nref: fm-wave-i-job1/escalate", "wake-1")
+    assert cli.main(["shadow-report", str(path)]) == 0
+    out = capsys.readouterr().out.splitlines()
+    assert out[0] == f"{THREAD}  job1" and out[-2] == "(no thread)  (no job)"
+    assert "post  fm-wave-i-job1/checkin  job 1 checking in" in out[1] and out[1].endswith("x" * 62) and " ET  " in out[1]
+    assert "wake  wake-1  wake ref: fm-wave-i-job1/escalate" in out[2]
+    assert "board  api graphql --input" in out[-1]
+    assert cli.main(["shadow-report", str(path), "--thread", "(no thread)"]) == 0
+    assert capsys.readouterr().out.splitlines()[0] == "(no thread)  (no job)"
+
+
+def test_shadow_report_infers_old_gh_rows_from_the_shadow_states_waves(tmp_path, capsys):
+    from test_issue69_wave import THREAD as WAVE
+    path, state = tmp_path / "s.jsonl", tmp_path / "shadow.sqlite3"
+    path.write_text(json.dumps({"at": 1791857000.0, "ts": "1791857000.000000", "kind": "gh", "key": "gh:1", "argv": ["gh", "pr", "merge", "72", "-R", "o/r"], "stdin": None}) + "\n")
+    store = Store(state)
+    store.set_meta(wave.wave_key(WAVE), opened_wave(tmp_path)[0][1].to_json())
+    store.close()
+    assert cli.main(["shadow-report", str(path), "--state", str(state)]) == 0
+    out = capsys.readouterr().out.splitlines()
+    assert out[0] == f"{WAVE}  job2" and "merge  pr merge 72" in out[1]
+
+
+def test_a_three_job_wave_in_shadow_writes_each_action_once_across_a_restart(tmp_path, capsys):
+    """The real Driver over a fake daemon and fake gh, through ShadowClient and shadow.runner: check-in, approval and
+    close; restarted halfway. Each action is in the sink once, the daemon and gh see no write, the report lists them."""
+    from test_issue69b_driver import CLOSE_REF, Driver, FakeClient, FakeGh, first_half, second_half, setup  # noqa: F401
+    from test_issue69b_driver import CFG, SimpleNamespace, THREAD as WAVE
+    path = tmp_path / "s.jsonl"
+    store, client, gh, clock, _ = setup(tmp_path)
+
+    def make(store):
+        sink = shadow.Sink(path, clock=clock)
+        gate = shadow.runner(gh.run, sink, waves=lambda: cli.waves(store))
+        return Driver(CFG, shadow.ShadowClient(client, sink, owner=OWNER), store, llm=lambda *a: {}, clock=clock, sleep=lambda s: None,
+                      github=SimpleNamespace(run=gate, poll=lambda *a: None))
+    first_half(store, client, gh, clock, make(store))
+    store.close()
+    store = Store(tmp_path / "s.sqlite3")  # a restart: new store, new sink, same files
+    second_half(store, client, gh, clock, make(store))
+    for _ in range(2): make(store).run_once()
+    rows = shadow.read_rows(path)
+    assert client.posts == [] and all(shadow.is_read(a) for a in gh.calls)  # the daemon and gh saw zero writes
+    assert len({r["key"] for r in rows}) == len(rows) and rows  # each action exactly once
+    refs = [r["ref"] for r in rows if r["kind"] == "post_message"]
+    assert refs.count(CLOSE_REF) == 1 and len(refs) == len(set(refs))
+    assert all(r["thread"] == WAVE for r in rows if r["kind"] == "post_message")
+    assert cli.main(["shadow-report", str(path)]) == 0
+    out = capsys.readouterr().out
+    assert CLOSE_REF in out and out.count("  post  ") == len(refs)
+
+
+def test_deputy_wakes_in_shadow_go_to_the_sink_once_under_their_job(tmp_path, capsys):
+    """The real Driver's escalation ladder through the shadow: each wake is one `instruct` row, filed under the job of
+    its text's `ref:` line (its client id names none), never sent to the daemon, and not repeated across a restart."""
+    from fridica_research.driver import Driver
+    from test_issue69_wave import H, T0
+    from test_issue69b_driver import CFG, SimpleNamespace
+    from test_issue69b_driver import THREAD as WAVE
+    from test_issue83_driver import ladder_world
+    path = tmp_path / "w.jsonl"
+    store, client, gh, clock, _ = ladder_world(tmp_path, prs=False)
+
+    def make(store):
+        sink = shadow.Sink(path, clock=clock)
+        return Driver(CFG, shadow.ShadowClient(client, sink, owner=OWNER), store, llm=lambda *a: {}, clock=clock, sleep=lambda s: None,
+                      github=SimpleNamespace(run=shadow.runner(gh.run, sink, waves=lambda: cli.waves(store)), poll=lambda *a: None))
+    clock.t = T0 + 2 * H
+    make(store).run_once()
+    clock.t = T0 + 2 * H + 31 * 60
+    for _ in range(2):
+        make(store).run_once()  # a fresh driver and sink each pass: a restart
+        clock.t += 60
+    wakes = [r for r in shadow.read_rows(path) if r["kind"] == "instruct"]
+    assert client.instructs == [] and client.posts == []
+    assert sorted(r["job"] for r in wakes) == ["job1", "job2", "job3"] and all(r["thread"] == WAVE and r["ref"].startswith("wake-") for r in wakes)
+    assert cli.main(["shadow-report", str(path)]) == 0
+    assert capsys.readouterr().out.count("  wake  wake-") == 3

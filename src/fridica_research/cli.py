@@ -1,4 +1,4 @@
-"""`fridica-research start | adopt | list | stop | resume | note | pr | serve | replay | score | wave` (argparse, stdlib only).
+"""`fridica-research start | adopt | list | stop | resume | note | pr | serve | shadow-report | replay | score | wave` (argparse, stdlib only).
 `wave` has open, status [--json], drop, add-job, bind-pr, eta and close."""
 from __future__ import annotations
 
@@ -130,7 +130,7 @@ def cmd_serve(cfg: config.Config, args) -> int:
                 if stuck:
                     print(f"open wave(s) {', '.join(stuck)} but [github] and [board] are both off: no PR or merge would ever be seen; enable [github] or close the wave", file=sys.stderr)
                     return 1
-            gate = (lambda env: shadow.runner(subprocess_runner(env), sink)) if sink is not None else (lambda env: None)
+            gate = (lambda env: shadow.runner(subprocess_runner(env), sink, waves=lambda: waves(store))) if sink is not None else (lambda env: None)
             board = Board(cfg, runner=gate(cfg.board.token_env), remember=store.set_meta, recall=store.get_meta) if cfg.board.enabled else None
             github = GitHub(cfg, runner=gate(cfg.github.token_env), remember=store.set_meta, recall=store.get_meta) if cfg.github.enabled else None
             client = build_client(cfg) if sink is None else shadow.ShadowClient(build_client(cfg), sink, owner=cfg.owner)
@@ -282,6 +282,10 @@ def parser() -> argparse.ArgumentParser:
     v.add_argument("--once", action="store_true", help="one pass over the feed, then exit")
     v.add_argument("--dry-run", action="store_true", help="shadow mode (#106): reads stay real, every write goes to <state_file>.dry-run.jsonl")
     v.add_argument("--state", default=None, help="the state file to serve (with --dry-run, default <state_file>.dry-run; never seeded from the real one)")
+    sr = sub.add_parser("shadow-report", help="list a serve --dry-run sink's would-be actions per thread and job, in time order (#106)")
+    sr.add_argument("sink", help="the <state_file>.dry-run.jsonl to read")
+    sr.add_argument("--thread", default=None, help='only this thread ("(no thread)" for rows naming no PR or issue)')
+    sr.add_argument("--state", default=None, help="the shadow state file, whose waves give gh rows their thread and job")
     r = sub.add_parser("replay", help="fold a replay corpus (or every corpus under a directory) through the machine and compare (R19)")
     r.add_argument("path", help="a corpus directory or a parent such as tests/bootstrap")
     r.add_argument("--strict", action="store_true", help="textual differences (D1) fail too")
@@ -345,6 +349,24 @@ def cmd_score(args) -> int:
     return 0
 
 
+def cmd_shadow_report(args) -> int:
+    """#106: the sink's would-be posts, wakes, review requests, board writes and merges per thread and job; read only."""
+    try: rows = shadow.read_rows(args.sink)
+    except (FileNotFoundError, shadow.SinkCorrupt) as e:
+        print(str(e), file=sys.stderr)
+        return 1
+    found = []
+    if args.state:
+        if not Path(args.state).exists():
+            print(f"no state file {args.state}", file=sys.stderr)
+            return 1
+        store = Store(args.state)
+        try: found = waves(store)
+        finally: store.close()
+    for line in shadow.report_lines(rows, thread=args.thread, waves=found): print(line)
+    return 0
+
+
 def cmd_replay(args) -> int:
     report = replay(args.path, strict=args.strict, accept_added_fields=args.accept_added_fields)
     print(report.text())
@@ -355,6 +377,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     if args.cmd == "replay": return cmd_replay(args)
     if args.cmd == "score": return cmd_score(args)
+    if args.cmd == "shadow-report": return cmd_shadow_report(args)
     if args.cmd == "roles":
         print("driver and arbitrator (policy only; never delegated)")
         for role in ROLES:

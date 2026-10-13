@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import dataclasses
 import hashlib
+from datetime import datetime
+from zoneinfo import ZoneInfo
 import json
 import logging
 import re
@@ -90,6 +92,44 @@ def ts_after(at: float, last: str | None) -> str:
     return f"{sec + us // 1_000_000}.{us % 1_000_000:06d}"
 
 
+NO_THREAD = "(no thread)"
+JOB_REF = re.compile(r"\bfm-wave-\S+?-job(\d+)\b")
+
+
+def job_of(ref: str | None) -> str:
+    """`job<N>` from a `fm-wave-<w>-jobN` ref (any suffix), else empty."""
+    m = JOB_REF.search(ref or "")
+    return f"job{m.group(1)}" if m else ""
+
+
+def gh_target(argv: list[str], stdin: str | None = None) -> tuple[str, int | None]:
+    """The repo (`-R`, `--repo` or a `repos/<o>/<r>/` endpoint) and the PR or issue number a gh write names, if any."""
+    a = [str(x) for x in argv or []]
+    repo, num = "", None
+    for flag in ("-R", "--repo"):
+        if flag in a and a.index(flag) + 1 < len(a): repo = a[a.index(flag) + 1]
+    for x in a:
+        m = re.match(r"/?repos/([^/]+/[^/]+)/(?:pulls|issues)/(\d+)", x)
+        if m: return m.group(1), int(m.group(2))
+    if len(a) > 3 and a[1] in ("pr", "issue") and a[3].isdigit(): num = int(a[3])
+    elif len(a) > 3 and a[1] in ("pr", "issue"):
+        m = re.match(r"https://github\.com/([^/]+/[^/]+)/(?:pull|issues)/(\d+)", a[3])
+        if m: repo, num = m.group(1), int(m.group(2))
+    return repo, num
+
+
+def attribute(argv: list[str], stdin: str | None, waves) -> tuple[str, str]:
+    """(thread, job) of a gh write: the wave job whose recorded PR or issue is the number the write names, in the same
+    repo only (never across repos); `("", "")` when no number, no repo or no job matches (the "(no thread)" rows)."""
+    repo, num = gh_target(argv, stdin)
+    if not repo or num is None: return "", ""
+    for thread, w in waves or []:
+        for n, j in enumerate(w.jobs, 1):
+            if (j.repo or w.repo) != repo: continue
+            if num == j.rnd().pr.get("number") or num == j.issue: return thread, f"job{n}"
+    return "", ""
+
+
 class Sink:
     """One JSON line per would-be write at `path`; each key is written once, across restarts. Each row carries a
     Slack-style ts from the clock's microseconds, strictly after every earlier row's, so shadow posts sort among the
@@ -126,7 +166,7 @@ class Sink:
         """Append the action unless its key is already in the sink; True when it was new."""
         if key in self.keys: return False
         at = self.clock()
-        row = {"at": at, "ts": ts_after(at, self.last_ts()), "kind": kind, "key": key, **fields}
+        row = {"at": at, "ts": ts_after(at, self.last_ts()), "kind": kind, "key": key, "thread": "", "job": "", **fields}
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.path.open("a") as f: f.write(json.dumps(row, sort_keys=True) + "\n")
         self.rows.append(row)
@@ -136,12 +176,14 @@ class Sink:
     def posts(self, thread: str) -> list[dict]: return [r for r in self.rows if r["kind"] == "post_message" and r.get("thread") == thread]
 
 
-def runner(real, sink: Sink):
-    """A gh runner: reads go to `real`, every other call to the sink (keyed by a hash of argv and stdin) and returns `{}`."""
+def runner(real, sink: Sink, waves=None):
+    """A gh runner: reads go to `real`, every other call to the sink (keyed by a hash of argv and stdin) and returns `{}`.
+    `waves()` gives the shadow store's `(thread, Wave)` pairs, from which each row's thread and job are inferred."""
     def run(argv, stdin):
         if is_read(argv, stdin): return real(argv, stdin)
         key = "gh:" + digest(list(argv), stdin)
-        sink.record("gh", key, argv=list(argv), stdin=stdin)
+        thread, job = attribute(list(argv), stdin, waves() if waves else [])
+        sink.record("gh", key, argv=list(argv), stdin=stdin, thread=thread, job=job)
         return answer(list(argv), stdin, key)
     return run
 
@@ -184,7 +226,8 @@ class ShadowClient:
     def _sink(self, kind: str, thread: str, text: str = "", ref: str | None = None, **fields) -> dict:
         ref = ref or contracts.ref_of(text or "")
         key = f"{kind}:{thread}:" + (ref or digest(text, fields))
-        self.sink.record(kind, key, thread=thread, ref=ref, text=text, **fields)
+        job = job_of(contracts.ref_of(text or "")) or job_of(ref)  # a wake's job is on its text's `ref:` line, not its client id
+        self.sink.record(kind, key, thread=thread, ref=ref, text=text, job=job, **fields)
         return {"ok": True, "dry_run": True}
 
     def post_message(self, thread: str, req: contracts.PostRequest) -> dict: return self._sink("post_message", thread, req.text, post_kind=req.kind)
@@ -196,3 +239,54 @@ class ShadowClient:
     def set_driver(self, thread: str, driver: str) -> dict: return self._sink("set_driver", thread, ref=f"driver:{driver}", driver=driver)
     def instruct(self, thread: str, text: str, client_id: str, actor: str = "owner") -> dict: return self._sink("instruct", thread, text, ref=client_id, actor=actor)
     def post(self, target: str, body: dict) -> dict: return self._sink("post", target, ref=digest(target, body), body=body)
+
+
+ET = ZoneInfo("America/New_York")
+
+
+def gh_kind(argv: list[str], stdin: str | None) -> str:
+    """The report kind of a gh write: merge, review request, board write, or plain gh."""
+    a, body = " ".join(str(x) for x in argv), stdin or ""
+    if a.startswith("gh pr merge") or "mergePullRequest" in a + body or "/merge" in a: return "merge"
+    if "requested_reviewers" in a or "requestReviews" in a + body: return "review request"
+    if a.startswith(("gh project", "gh api graphql", "gh issue edit", "gh issue comment")) or "/milestones" in a or "/comments" in a: return "board"
+    return "gh"
+
+
+REPORT_KINDS = {"post_message": "post", "post_root": "root", "instruct": "wake", "delegate": "delegate", "stop_worker": "stop", "set_driver": "driver", "post": "post"}
+
+
+def report_lines(rows: list[dict], thread: str | None = None, waves=None) -> list[str]:
+    """`shadow-report`: per thread and job, the would-be actions in time order, one line each: time ET, kind, ref or
+    target, and the first 80 characters of the text. Rows with no thread (a board write naming no PR or issue) are under
+    "(no thread)"; a gh row without a thread or job gets them from `waves` when its PR or issue is a job's, same repo."""
+    groups: dict[tuple[str, str], list[dict]] = {}
+    for r in rows:
+        t, j = r.get("thread") or "", r.get("job") or ""
+        if r.get("kind") == "gh" and not t: t, j = attribute(r.get("argv") or [], r.get("stdin"), waves or [])
+        t = t or NO_THREAD
+        if thread is not None and t != thread: continue
+        groups.setdefault((t, j), []).append(r)
+    out = []
+    for (t, j), rs in sorted(groups.items(), key=lambda kv: (kv[0][0] == NO_THREAD, kv[0])):
+        out.append(f"{t}  {j or '(no job)'}")
+        for r in sorted(rs, key=lambda r: ts_key(r["ts"]) if r.get("ts") else (int(r.get("at") or 0), 0)):
+            when = datetime.fromtimestamp(float(r.get("at") or 0), ET).strftime("%Y-%m-%d %H:%M:%S ET")
+            if r.get("kind") == "gh":
+                argv = [str(x) for x in r.get("argv") or []]
+                kind, target, text = gh_kind(argv, r.get("stdin")), " ".join(argv[1:4]), r.get("stdin") or " ".join(argv)
+            else: kind, target, text = REPORT_KINDS.get(r.get("kind"), r.get("kind", "?")), r.get("ref") or r.get("thread") or "", r.get("text") or json.dumps(r.get("body") or {}, sort_keys=True)
+            out.append(f"  {when}  {kind}  {target}  {' '.join(str(text).split())[:80]}")
+    return out
+
+
+def read_rows(path) -> list[dict]:
+    """The sink's rows, read only (a torn last line is skipped, never cut: the report changes nothing)."""
+    lines = [x for x in Path(path).read_text().split("\n")]
+    rows = []
+    for n, raw in enumerate(lines, 1):
+        if not raw.strip(): continue
+        try: rows.append(json.loads(raw))
+        except json.JSONDecodeError:
+            if n != len(lines): raise SinkCorrupt(f"{path}: line {n} is not valid JSON; the shadow record is damaged") from None
+    return rows
