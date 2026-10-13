@@ -110,12 +110,18 @@ def latest_verdicts(reviews: list[dict]) -> dict[str, dict]:
     return out
 
 
-LIST_FIELDS = "number,headRefOid,state,isDraft,author,body"  # what adoption of a round's PR reads (#46 slice 2)
+LIST_FIELDS = "number,headRefOid,state,isDraft,author,body,milestone"  # what adoption of a round's PR reads (#46 slice 2)
+
+
+def with_milestone(prs: list[dict]) -> list[dict]:
+    """Each PR keeps gh's raw `milestone` object as returned; a PR without one reads `milestone: None` (#91)."""
+    for p in prs: p["milestone"] = p.get("milestone") or None
+    return prs
 
 
 def list_prs(run: Runner, repo: str, author: str) -> list[dict]:
     """The open PRs of `author` on `repo`, drafts included: the candidates a round adopts from."""
-    return json.loads(run(["gh", "pr", "list", "-R", repo, "--author", author, "--state", "open", "--json", LIST_FIELDS], None) or "[]")
+    return with_milestone(json.loads(run(["gh", "pr", "list", "-R", repo, "--author", author, "--state", "open", "--json", LIST_FIELDS], None) or "[]"))
 
 
 MERGEABLE = ("MERGEABLE", "CONFLICTING", "UNKNOWN")
@@ -158,7 +164,7 @@ def request_reviewers(run: Runner, pr: str, logins: list[str]):
         raise
 
 
-ISSUE_FIELDS = "number,url,title,body,state,isDraft,author,headRefOid,mergedAt"
+ISSUE_FIELDS = "number,url,title,body,state,isDraft,author,headRefOid,mergedAt,milestone"
 
 
 def references(text: str, issue: int) -> bool:
@@ -170,7 +176,7 @@ def list_prs_for_issue(run: Runner, repo: str, issue: int | str) -> list[dict]:
     """The PRs of `repo` in every state (open, closed, merged) whose title or body references `#<issue>`."""
     n = int(str(issue).lstrip("#"))
     prs = json.loads(run(["gh", "pr", "list", "-R", repo, "--state", "all", "--search", f"#{n}", "--limit", "200", "--json", ISSUE_FIELDS], None) or "[]")
-    return [p for p in prs if references(p.get("title", ""), n) or references(p.get("body", ""), n)]
+    return with_milestone([p for p in prs if references(p.get("title", ""), n) or references(p.get("body", ""), n)])
 
 
 def pr_reviews(run: Runner, pr: str) -> list[dict]:
